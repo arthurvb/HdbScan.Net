@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <Title>HdbScan.Net</Title>
+    <Version>1.0.0</Version>
+    <Authors>arthurvb</Authors>
+    <Description>HDBSCAN (Hierarchical Density-Based Spatial Clustering of Applications with Noise) for .NET</Description>
+    <PackageProjectUrl>https://github.com/arthurvb/HdbScan.Net</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/arthurvb/HdbScan.Net</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>hdbscan;clustering;density;machine-learning;data-analysis</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

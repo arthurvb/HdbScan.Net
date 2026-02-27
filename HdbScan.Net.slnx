@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="HdbScan.Net.Test/HdbScan.Net.Test.csproj" />
+  <Project Path="HdbScan.Net/HdbScan.Net.csproj" />
+</Solution>
