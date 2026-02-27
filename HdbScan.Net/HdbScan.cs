@@ -85,24 +85,28 @@ namespace HdbScan.Net
 
             var n = points.Count;
 
-            // Compute core distances.
+            // Algorithm pipeline (Paper, Section 3):
+            //
+            //   1. Compute core distances           (Definition 3)
+            //   2. Build mutual reachability graph   (Definition 4)
+            //   3. Compute MST of that graph         (Theorem 1 — equivalent to MST_k)
+            //   4. Build hierarchical clustering     (single-linkage dendrogram)
+            //   5. Condense the dendrogram           (Section 4 — extract condensed tree)
+            //   6. Extract flat clustering           (FOSC framework, Section 5)
+            //   7. Compute outlier scores            (GLOSH — Campello et al. 2015)
+
             var coreDistances = ComputeCoreDistances(points, distanceMetric, minSamples);
 
-            // Build minimum spanning tree of the mutual reachability graph.
             var mst = BuildMst(points, distanceMetric, coreDistances);
 
-            // Build single-linkage dendrogram.
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             var singleLinkageTree = BuildSingleLinkageTree(mst, n);
 
-            // Condense the tree.
             var condensedTree = CondenseTree(singleLinkageTree, minClusterSize);
 
-            // Extract flat clustering.
             var (clusterLabels, clusterProbs, numClusters) = ExtractClusters(
                 condensedTree, n, options.ClusterSelectionMethod, options.AllowSingleCluster);
 
-            // Compute outlier scores.
             var scores = ComputeOutlierScores(condensedTree, n);
 
             labels = clusterLabels;
@@ -163,6 +167,10 @@ namespace HdbScan.Net
                 return (-1, 0);
             }
 
+            // For each cluster, find the minimum mutual reachability distance from x
+            // to any core point in that cluster. The new point's core distance is unknown,
+            // so we use a one-sided MRD: max(core(training_point), d(x, training_point)).
+            // This matches sklearn's approximate_predict approach.
             var clusterDistances = new double[clusterCount];
             for (var i = 0; i < clusterCount; i++)
             {
@@ -199,6 +207,7 @@ namespace HdbScan.Net
                 return (-1, 0);
             }
 
+            // Soft assignment: probability proportional to inverse distance.
             const double epsilon = 1e-10;
             var prob = 1.0;
             if (clusterCount > 1)
@@ -244,6 +253,11 @@ namespace HdbScan.Net
         /// </summary>
         public bool HasPredictionData => points != null;
 
+        /// <summary>
+        /// Paper, Definition 3: core_k(x) = distance to the k-th nearest neighbor (including x).
+        /// After sorting all n distances (where distances[0] = 0 for self), distances[k-1] is
+        /// the k-th nearest including self. Matches sklearn: tree.query(X, k=min_samples)[0][:, -1].
+        /// </summary>
         private static double[] ComputeCoreDistances(IReadOnlyList<T> points, Func<T, T, double> dm, int k)
         {
             var n = points.Count;
@@ -264,6 +278,11 @@ namespace HdbScan.Net
             return coreDistances;
         }
 
+        /// <summary>
+        /// Paper, Theorem 1: the MST of the mutual reachability graph equals MST_k, the
+        /// "extended minimum spanning tree" that encodes all density-based hierarchical
+        /// clusterings. Built via Prim's algorithm in O(n^2), matching sklearn's generic path.
+        /// </summary>
         private static MstEdge[] BuildMst(IReadOnlyList<T> points, Func<T, T, double> dm, double[] coreDistances)
         {
             var n = points.Count;
@@ -321,6 +340,11 @@ namespace HdbScan.Net
             return edges.ToArray();
         }
 
+        /// <summary>
+        /// Paper, Definition 4: d_mreach(a, b) = max(core(a), core(b), d(a, b)).
+        /// Effectively "pushes apart" points in sparse regions while preserving distances
+        /// in dense regions.
+        /// </summary>
         private static double MutualReachabilityDistance(IReadOnlyList<T> points, Func<T, T, double> dm,
             double[] coreDistances, int i, int j)
         {
@@ -328,6 +352,11 @@ namespace HdbScan.Net
             return Math.Max(Math.Max(coreDistances[i], coreDistances[j]), dist);
         }
 
+        /// <summary>
+        /// Converts the sorted MST into a single-linkage dendrogram using Union-Find.
+        /// Produces the same structure as scipy.cluster.hierarchy.linkage: each row is
+        /// (left, right, distance, size). Points are 0..n-1; internal nodes are n, n+1, ...
+        /// </summary>
         private static SingleLinkageNode[] BuildSingleLinkageTree(MstEdge[] sortedMst, int n)
         {
             var uf = new UnionFind(n);
@@ -357,6 +386,17 @@ namespace HdbScan.Net
             return tree.ToArray();
         }
 
+        /// <summary>
+        /// Paper, Section 4: walks the dendrogram top-down, pruning splits where a child has
+        /// fewer than minClusterSize points. Uses lambda = 1/distance as the density level.
+        ///
+        /// At each split:
+        ///   - Both children large enough  -> genuine split, two new child clusters
+        ///   - One child too small          -> small side's points "fall out"; large side inherits
+        ///   - Both too small               -> all points fall out of the parent cluster
+        ///
+        /// The output is a list of directed edges (parent -> child_cluster or parent -> point).
+        /// </summary>
         private static List<CondensedTreeEdge> CondenseTree(SingleLinkageNode[] singleLinkageTree, int minClusterSize)
         {
             const double epsilon = 1e-10;
@@ -364,6 +404,8 @@ namespace HdbScan.Net
             var n = singleLinkageTree.Length + 1;
             var condensed = new List<CondensedTreeEdge>();
 
+            // Map each dendrogram node to (left, right, lambda, size).
+            // Lambda = 1/(distance + epsilon) converts distance to density level.
             var nodeInfo = new Dictionary<int, (int Left, int Right, double Lambda, int Size)>();
             var nodeLabel = n;
             foreach (var node in singleLinkageTree)
@@ -372,6 +414,7 @@ namespace HdbScan.Net
                 nodeLabel++;
             }
 
+            // Relabel clusters in the condensed tree starting from n (the root).
             var root = nodeLabel - 1;
             var relabel = new Dictionary<int, int> { [root] = n };
             var nextCondensedLabel = n + 1;
@@ -391,6 +434,7 @@ namespace HdbScan.Net
 
                 if (leftSize >= minClusterSize && rightSize >= minClusterSize)
                 {
+                    // Genuine split: both children become new clusters.
                     relabel[left] = nextCondensedLabel++;
                     relabel[right] = nextCondensedLabel++;
                     condensed.Add(new CondensedTreeEdge(relabel[parent], relabel[left], lambdaVal, leftSize));
@@ -400,6 +444,7 @@ namespace HdbScan.Net
                 }
                 else if (leftSize >= minClusterSize)
                 {
+                    // Left survives; right's points fall out of the current cluster.
                     relabel[left] = relabel[parent];
                     FallOutPoints(right, lambdaVal, relabel[parent]);
                     ProcessNode(left, parent);
@@ -412,11 +457,13 @@ namespace HdbScan.Net
                 }
                 else
                 {
+                    // Neither child is large enough — both fall out.
                     FallOutPoints(left, lambdaVal, relabel[parent]);
                     FallOutPoints(right, lambdaVal, relabel[parent]);
                 }
             }
 
+            // Records all leaf points under a too-small subtree as departing at the split's lambda.
             void FallOutPoints(int node, double lambda, int parentCluster)
             {
                 if (node < n)
@@ -479,6 +526,7 @@ namespace HdbScan.Net
             HashSet<int> selectedClusters;
             if (method == ClusterSelectionMethod.Leaf)
             {
+                // Leaf method: select clusters that have no child clusters (only point edges).
                 var clustersWithChildren = new HashSet<int>();
                 foreach (var (source, edges) in edgesBySource)
                 {
@@ -503,6 +551,10 @@ namespace HdbScan.Net
                 return (labels, probabilities, 0);
             }
 
+            // Max lambda from the selected cluster's direct point edges, used to normalize
+            // membership probabilities. Points from descendant sub-clusters (which may have
+            // higher lambdas) get clamped to 1.0 — they are the most central cluster members.
+            // Matches sklearn's _get_probabilities behavior.
             var clusterMaxLambda = new Dictionary<int, double>();
             foreach (var cluster in selectedClusters)
             {
@@ -522,11 +574,14 @@ namespace HdbScan.Net
 
             var clusterToLabel = selectedClusters.Select((c, i) => (c, i)).ToDictionary(x => x.c, x => x.i);
 
+            // Assign each point to the nearest selected ancestor in the condensed tree.
+            // Probability = lambda_point / max_lambda_cluster, clamped to [0, 1].
             foreach (var edge in condensedTree.Where(e => e.Target < n))
             {
                 var point = edge.Target;
                 var cluster = edge.SourceCluster;
 
+                // Walk up to the selected cluster (may be the source itself or an ancestor).
                 while (!selectedClusters.Contains(cluster))
                 {
                     if (!edgeByTarget.TryGetValue(cluster, out var parentEdge)) break;
@@ -544,14 +599,29 @@ namespace HdbScan.Net
             return (labels, probabilities, selectedClusters.Count);
         }
 
+        /// <summary>
+        /// Paper, Section 5 / FOSC framework: selects a flat clustering by maximizing
+        /// total cluster stability subject to the constraint that selected clusters are
+        /// non-overlapping (at most one per root-to-leaf path in the condensed tree).
+        ///
+        /// Stability of cluster C (Equation 3):
+        ///   S(C) = sum over all edges from C of: (lambda_edge - lambda_birth(C)) * edge.Size
+        ///
+        /// Bottom-up traversal: if a parent's stability exceeds the sum of its children's
+        /// stabilities, select the parent and deselect all descendants. Otherwise, propagate
+        /// the children's combined stability upward. This greedy approach is provably optimal.
+        /// </summary>
         private static HashSet<int> SelectClustersEom(
             Dictionary<int, List<CondensedTreeEdge>> edgesBySource,
             Dictionary<int, CondensedTreeEdge> edgeByTarget,
             HashSet<int> clusters, int n, bool allowSingleCluster)
         {
+            // Compute stability for each cluster.
             var stability = new Dictionary<int, double>();
             foreach (var cluster in clusters)
             {
+                // Birth lambda = the lambda at which this cluster first appeared.
+                // For the root cluster, birth lambda = 0.
                 var birthLambda = edgeByTarget.TryGetValue(cluster, out var parentEdge) ? parentEdge.Lambda : 0.0;
 
                 var stab = 0.0;
@@ -583,6 +653,7 @@ namespace HdbScan.Net
                 childClusters[cluster] = children;
             }
 
+            // Start with all leaf clusters selected, then propagate upward.
             var selected = new HashSet<int>();
             var processed = new HashSet<int>();
 
@@ -605,6 +676,8 @@ namespace HdbScan.Net
                 }
             }
 
+            // Process non-leaf clusters bottom-up. A cluster is ready once all
+            // its children have been processed; re-enqueue if not yet ready.
             var queue = new Queue<int>(clusters.Where(c => !processed.Contains(c)));
             while (queue.Count > 0)
             {
@@ -616,6 +689,7 @@ namespace HdbScan.Net
                     var childStability = children.Sum(c => stability[c]);
                     if (stability[cluster] > childStability)
                     {
+                        // Parent wins: select it, deselect all descendants.
                         foreach (var child in children)
                         {
                             RemoveDescendants(child);
@@ -624,6 +698,7 @@ namespace HdbScan.Net
                     }
                     else
                     {
+                        // Children win: propagate their combined stability upward.
                         stability[cluster] = childStability;
                     }
                     processed.Add(cluster);
@@ -634,6 +709,8 @@ namespace HdbScan.Net
                 }
             }
 
+            // Handle the root cluster (id = n). If it's the only selection,
+            // respect the allowSingleCluster setting.
             if (selected.Contains(n))
             {
                 if (selected.Count == 1)
@@ -652,6 +729,18 @@ namespace HdbScan.Net
             return selected;
         }
 
+        /// <summary>
+        /// GLOSH (Global-Local Outlier Score from Hierarchies).
+        /// Campello et al. (2015), "A framework for optimal selection of clusters."
+        ///
+        /// For each point: score = 1 - lambda_p / lambda_max(cluster).
+        /// lambda_max is propagated upward so each cluster's "death" reflects the peak
+        /// density anywhere in its subtree. This makes the score local — a point in a
+        /// sparse cluster is compared against that cluster's peak, not a distant dense one.
+        ///
+        /// Score near 0 = deep inside its cluster. Score near 1 = strong outlier.
+        /// Points absent from the condensed tree default to score 1.0.
+        /// </summary>
         private static double[] ComputeOutlierScores(List<CondensedTreeEdge> condensedTree, int n)
         {
             var scores = new double[n];
@@ -659,7 +748,6 @@ namespace HdbScan.Net
 
             if (condensedTree.Count == 0) return scores;
 
-            // Build deaths (max lambda) per source cluster and point edge lookup.
             var deaths = new Dictionary<int, double>();
             var parentOf = new Dictionary<int, int>();
             var pointEdge = new Dictionary<int, CondensedTreeEdge>();
@@ -685,8 +773,8 @@ namespace HdbScan.Net
                 }
             }
 
-            // Propagate deaths upward: children have higher IDs than parents,
-            // so processing from highest to lowest propagates correctly.
+            // Propagate max lambda from children to parents. Children have higher IDs
+            // than parents, so reverse-sorted order guarantees correct propagation.
             var clusterIds = new List<int>(deaths.Keys);
             clusterIds.Sort();
             for (var i = clusterIds.Count - 1; i >= 0; i--)
@@ -705,7 +793,6 @@ namespace HdbScan.Net
                 }
             }
 
-            // Score each point: 1 - lambda_point / deaths[source_cluster], clamped to [0,1].
             for (var i = 0; i < n; i++)
             {
                 if (pointEdge.TryGetValue(i, out var edge))
@@ -726,20 +813,13 @@ namespace HdbScan.Net
         // ================================================================================
         // Internal data structures
         //
-        // The HDBSCAN algorithm uses several intermediate tree representations:
+        // The algorithm transforms data through a sequence of representations:
         //
-        // 1. MstEdge: Edges in the minimum spanning tree of the mutual reachability graph.
+        //   MstEdge[]  ->  SingleLinkageNode[]  ->  List<CondensedTreeEdge>
+        //   (MST)          (dendrogram)              (condensed tree)
         //
-        // 2. SingleLinkageNode: Nodes in the hierarchical clustering dendrogram.
-        //    Each node represents the merge of two sub-clusters at a given distance.
-        //    Node IDs: points are 0..n-1, internal nodes are n, n+1, n+2, ...
-        //
-        // 3. CondensedTreeEdge: The condensed tree stored as a list of directed edges.
-        //    Each edge goes from a SourceCluster to a Target, which is either:
-        //    - Another cluster (Target >= n): a cluster split
-        //    - A point (Target < n): a point "falling out" at some density level
-        //
-        // 4. UnionFind: Disjoint set data structure for building the dendrogram.
+        // Node ID convention throughout: points are 0..n-1, internal/cluster nodes are n+.
+        // This matches scipy's linkage matrix format and sklearn's condensed tree layout.
         // ================================================================================
 
         private readonly struct MstEdge(int a, int b, double distance)
@@ -757,6 +837,11 @@ namespace HdbScan.Net
             public readonly int Size = size;
         }
 
+        /// <summary>
+        /// Condensed tree edge: SourceCluster -> Target at a given density level (Lambda).
+        /// Target is either a child cluster (>= n) or a point (&lt; n) that "fell out".
+        /// Size is the number of points: 1 for point edges, child cluster size for splits.
+        /// </summary>
         private readonly struct CondensedTreeEdge(int sourceCluster, int target, double lambda, int size)
         {
             public readonly int SourceCluster = sourceCluster;
@@ -773,6 +858,7 @@ namespace HdbScan.Net
 
             public UnionFind(int n)
             {
+                // 2*n slots: n for leaf points + up to n-1 for internal merge nodes.
                 parent = new int[2 * n];
                 size = new int[2 * n];
                 label = new int[2 * n];
@@ -789,11 +875,15 @@ namespace HdbScan.Net
             {
                 if (parent[x] != x)
                 {
-                    parent[x] = Find(parent[x]);
+                    parent[x] = Find(parent[x]); // Path compression.
                 }
                 return parent[x];
             }
 
+            /// <summary>
+            /// Merges two components under a new label (the next internal node ID).
+            /// Both old roots become children of newLabel, preserving dendrogram structure.
+            /// </summary>
             public void Union(int x, int y, int newLabel)
             {
                 var rootX = Find(x);

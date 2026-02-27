@@ -724,6 +724,45 @@ namespace HdbScan.Net.Test
             }
         }
 
+        /// <summary>
+        /// Validates HDBSCAN probabilities against scikit-learn on the Iris dataset.
+        /// Python reference (scikit-learn 1.3+):
+        ///   hdb = HDBSCAN(min_cluster_size=5, min_samples=5, cluster_selection_method='eom')
+        ///   hdb.fit(X)
+        ///   # Setosa (first 50): min prob = 0.313625, 21 points at prob=1.0
+        ///   # Other (last 100): min prob = 0.422159, 57 points at prob=1.0
+        /// </summary>
+        [Test]
+        public void Probabilities_Iris_MatchesScikitLearn()
+        {
+            var xs = ReadIris("iris.csv").ToArray();
+
+            var options = new HdbScanOptions
+            {
+                MinClusterSize = 5,
+                MinSamples = 5,
+                ClusterSelectionMethod = ClusterSelectionMethod.ExcessOfMass
+            };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options);
+
+            Assert.That(model.ClusterCount, Is.EqualTo(2));
+
+            // Validate probabilities match scikit-learn.
+            // When EOM selects non-leaf clusters, points from dense sub-clusters
+            // get probability=1.0 (they are the most central members).
+            var setosaProbs = model.Probabilities.Take(50).ToArray();
+            Assert.That(setosaProbs.Min(), Is.EqualTo(0.313625).Within(1e-4),
+                "Setosa min probability should match scikit-learn");
+            Assert.That(setosaProbs.Count(p => Math.Abs(p - 1.0) < 1e-9), Is.EqualTo(21),
+                "Setosa should have 21 points at prob=1.0 (matching scikit-learn)");
+
+            var otherProbs = model.Probabilities.Skip(50).ToArray();
+            Assert.That(otherProbs.Min(), Is.EqualTo(0.422159).Within(1e-4),
+                "Versicolor+virginica min probability should match scikit-learn");
+            Assert.That(otherProbs.Count(p => Math.Abs(p - 1.0) < 1e-9), Is.EqualTo(57),
+                "Versicolor+virginica should have 57 points at prob=1.0 (matching scikit-learn)");
+        }
+
         [Test]
         public void OutlierScores_Iris_MatchesScikitLearn()
         {
