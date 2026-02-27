@@ -103,7 +103,7 @@ namespace HdbScan.Net
                 condensedTree, n, options.ClusterSelectionMethod, options.AllowSingleCluster);
 
             // Compute outlier scores.
-            var scores = ComputeOutlierScores(condensedTree, clusterLabels, n);
+            var scores = ComputeOutlierScores(condensedTree, n);
 
             labels = clusterLabels;
             probabilities = clusterProbs;
@@ -250,9 +250,9 @@ namespace HdbScan.Net
             var coreDistances = new double[n];
             k = Math.Min(k, n);
 
+            var distances = new double[n];
             for (var i = 0; i < n; i++)
             {
-                var distances = new double[n];
                 for (var j = 0; j < n; j++)
                 {
                     distances[j] = i == j ? 0 : dm(points[i], points[j]);
@@ -435,6 +435,26 @@ namespace HdbScan.Net
             return condensed;
         }
 
+        private static (Dictionary<int, List<CondensedTreeEdge>> EdgesBySource, Dictionary<int, CondensedTreeEdge> EdgeByTarget)
+            BuildCondensedTreeIndex(List<CondensedTreeEdge> condensedTree)
+        {
+            var edgesBySource = new Dictionary<int, List<CondensedTreeEdge>>();
+            var edgeByTarget = new Dictionary<int, CondensedTreeEdge>();
+
+            foreach (var edge in condensedTree)
+            {
+                if (!edgesBySource.TryGetValue(edge.SourceCluster, out var list))
+                {
+                    list = new List<CondensedTreeEdge>();
+                    edgesBySource[edge.SourceCluster] = list;
+                }
+                list.Add(edge);
+                edgeByTarget[edge.Target] = edge;
+            }
+
+            return (edgesBySource, edgeByTarget);
+        }
+
         private static (int[] Labels, double[] Probabilities, int ClusterCount) ExtractClusters(
             List<CondensedTreeEdge> condensedTree, int n, ClusterSelectionMethod method, bool allowSingleCluster)
         {
@@ -447,10 +467,9 @@ namespace HdbScan.Net
                 return (labels, probabilities, 0);
             }
 
-            var clusters = condensedTree
-                .Select(e => e.SourceCluster)
-                .Distinct()
-                .ToHashSet();
+            var (edgesBySource, edgeByTarget) = BuildCondensedTreeIndex(condensedTree);
+
+            var clusters = edgesBySource.Keys.ToHashSet();
 
             if (clusters.Count == 1 && !allowSingleCluster)
             {
@@ -460,15 +479,23 @@ namespace HdbScan.Net
             HashSet<int> selectedClusters;
             if (method == ClusterSelectionMethod.Leaf)
             {
-                var clustersWithChildren = condensedTree
-                    .Where(e => e.Target >= n)
-                    .Select(e => e.SourceCluster)
-                    .ToHashSet();
+                var clustersWithChildren = new HashSet<int>();
+                foreach (var (source, edges) in edgesBySource)
+                {
+                    foreach (var edge in edges)
+                    {
+                        if (edge.Target >= n)
+                        {
+                            clustersWithChildren.Add(source);
+                            break;
+                        }
+                    }
+                }
                 selectedClusters = clusters.Where(c => !clustersWithChildren.Contains(c) || c == n && clusters.Count == 1).ToHashSet();
             }
             else
             {
-                selectedClusters = SelectClustersEom(condensedTree, clusters, n, allowSingleCluster);
+                selectedClusters = SelectClustersEom(edgesBySource, edgeByTarget, clusters, n, allowSingleCluster);
             }
 
             if (selectedClusters.Count == 0)
@@ -479,11 +506,17 @@ namespace HdbScan.Net
             var clusterMaxLambda = new Dictionary<int, double>();
             foreach (var cluster in selectedClusters)
             {
-                var maxLambda = condensedTree
-                    .Where(e => e.SourceCluster == cluster && e.Target < n)
-                    .Select(e => e.Lambda)
-                    .DefaultIfEmpty(0)
-                    .Max();
+                var maxLambda = 0.0;
+                if (edgesBySource.TryGetValue(cluster, out var edges))
+                {
+                    foreach (var edge in edges)
+                    {
+                        if (edge.Target < n && edge.Lambda > maxLambda)
+                        {
+                            maxLambda = edge.Lambda;
+                        }
+                    }
+                }
                 clusterMaxLambda[cluster] = maxLambda;
             }
 
@@ -496,8 +529,7 @@ namespace HdbScan.Net
 
                 while (!selectedClusters.Contains(cluster))
                 {
-                    var parentEdge = condensedTree.FirstOrDefault(e => e.Target == cluster);
-                    if (parentEdge.SourceCluster == 0 && parentEdge.Target == 0) break;
+                    if (!edgeByTarget.TryGetValue(cluster, out var parentEdge)) break;
                     cluster = parentEdge.SourceCluster;
                 }
 
@@ -512,22 +544,23 @@ namespace HdbScan.Net
             return (labels, probabilities, selectedClusters.Count);
         }
 
-        private static HashSet<int> SelectClustersEom(List<CondensedTreeEdge> condensedTree, HashSet<int> clusters,
-            int n, bool allowSingleCluster)
+        private static HashSet<int> SelectClustersEom(
+            Dictionary<int, List<CondensedTreeEdge>> edgesBySource,
+            Dictionary<int, CondensedTreeEdge> edgeByTarget,
+            HashSet<int> clusters, int n, bool allowSingleCluster)
         {
             var stability = new Dictionary<int, double>();
             foreach (var cluster in clusters)
             {
-                var birthLambda = condensedTree
-                    .Where(e => e.Target == cluster)
-                    .Select(e => e.Lambda)
-                    .DefaultIfEmpty(0)
-                    .First();
+                var birthLambda = edgeByTarget.TryGetValue(cluster, out var parentEdge) ? parentEdge.Lambda : 0.0;
 
                 var stab = 0.0;
-                foreach (var edge in condensedTree.Where(e => e.SourceCluster == cluster))
+                if (edgesBySource.TryGetValue(cluster, out var edges))
                 {
-                    stab += (edge.Lambda - birthLambda) * edge.Size;
+                    foreach (var edge in edges)
+                    {
+                        stab += (edge.Lambda - birthLambda) * edge.Size;
+                    }
                 }
 
                 stability[cluster] = Math.Max(0, stab);
@@ -536,10 +569,18 @@ namespace HdbScan.Net
             var childClusters = new Dictionary<int, List<int>>();
             foreach (var cluster in clusters)
             {
-                childClusters[cluster] = condensedTree
-                    .Where(e => e.SourceCluster == cluster && e.Target >= n)
-                    .Select(e => e.Target)
-                    .ToList();
+                var children = new List<int>();
+                if (edgesBySource.TryGetValue(cluster, out var clusterEdges))
+                {
+                    foreach (var edge in clusterEdges)
+                    {
+                        if (edge.Target >= n)
+                        {
+                            children.Add(edge.Target);
+                        }
+                    }
+                }
+                childClusters[cluster] = children;
             }
 
             var selected = new HashSet<int>();
@@ -611,26 +652,68 @@ namespace HdbScan.Net
             return selected;
         }
 
-        private static double[] ComputeOutlierScores(List<CondensedTreeEdge> condensedTree, int[] labels, int n)
+        private static double[] ComputeOutlierScores(List<CondensedTreeEdge> condensedTree, int n)
         {
             var scores = new double[n];
+            for (var i = 0; i < n; i++) scores[i] = 1.0;
 
-            var maxLambda = condensedTree.Count > 0
-                ? condensedTree.Max(e => e.Lambda)
-                : 1.0;
+            if (condensedTree.Count == 0) return scores;
 
-            for (var i = 0; i < n; i++)
+            // Build deaths (max lambda) per source cluster and point edge lookup.
+            var deaths = new Dictionary<int, double>();
+            var parentOf = new Dictionary<int, int>();
+            var pointEdge = new Dictionary<int, CondensedTreeEdge>();
+
+            foreach (var edge in condensedTree)
             {
-                if (labels[i] == -1)
+                if (deaths.TryGetValue(edge.SourceCluster, out var current))
                 {
-                    scores[i] = 1.0;
+                    if (edge.Lambda > current) deaths[edge.SourceCluster] = edge.Lambda;
                 }
                 else
                 {
-                    var pointEdge = condensedTree.FirstOrDefault(e => e.Target == i);
-                    if (pointEdge.Lambda > 0)
+                    deaths[edge.SourceCluster] = edge.Lambda;
+                }
+
+                if (edge.Target >= n)
+                {
+                    parentOf[edge.Target] = edge.SourceCluster;
+                }
+                else
+                {
+                    pointEdge[edge.Target] = edge;
+                }
+            }
+
+            // Propagate deaths upward: children have higher IDs than parents,
+            // so processing from highest to lowest propagates correctly.
+            var clusterIds = new List<int>(deaths.Keys);
+            clusterIds.Sort();
+            for (var i = clusterIds.Count - 1; i >= 0; i--)
+            {
+                var cluster = clusterIds[i];
+                if (parentOf.TryGetValue(cluster, out var parent))
+                {
+                    if (deaths.TryGetValue(parent, out var parentDeath))
                     {
-                        scores[i] = 1.0 - (pointEdge.Lambda / maxLambda);
+                        if (deaths[cluster] > parentDeath) deaths[parent] = deaths[cluster];
+                    }
+                    else
+                    {
+                        deaths[parent] = deaths[cluster];
+                    }
+                }
+            }
+
+            // Score each point: 1 - lambda_point / deaths[source_cluster], clamped to [0,1].
+            for (var i = 0; i < n; i++)
+            {
+                if (pointEdge.TryGetValue(i, out var edge))
+                {
+                    var clusterDeath = deaths.TryGetValue(edge.SourceCluster, out var d) ? d : 1.0;
+                    if (clusterDeath > 0)
+                    {
+                        scores[i] = Math.Max(0, Math.Min(1.0, 1.0 - edge.Lambda / clusterDeath));
                     }
                 }
             }

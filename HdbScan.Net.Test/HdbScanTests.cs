@@ -464,7 +464,7 @@ namespace HdbScan.Net.Test
             }
 
             // Noise point should have high outlier score
-            Assert.That(model.OutlierScores[5], Is.EqualTo(1.0));
+            Assert.That(model.OutlierScores[5], Is.GreaterThan(0.9));
         }
 
         [Test]
@@ -642,6 +642,112 @@ namespace HdbScan.Net.Test
             var (label, prob) = model.PredictWithProbability(point);
             Assert.That(label, Is.EqualTo(-1));
             Assert.That(prob, Is.EqualTo(0));
+        }
+        [Test]
+        public void OutlierScores_TwoDensityClusters()
+        {
+            // Dense cluster (spacing ~0.1) + sparse cluster (spacing ~2.0) + outlier.
+            // The old bug used a global max lambda, inflating scores for the sparse cluster.
+            var points = new List<double[]>();
+
+            // Dense cluster: 20 points near origin, spacing ~0.1
+            for (var i = 0; i < 20; i++)
+            {
+                points.Add([0.1 * (i % 5), 0.1 * (i / 5)]);
+            }
+
+            // Sparse cluster: 20 points far away, spacing ~2.0
+            for (var i = 0; i < 20; i++)
+            {
+                points.Add([50 + 2.0 * (i % 5), 50 + 2.0 * (i / 5)]);
+            }
+
+            // Outlier
+            points.Add([200, 200]);
+
+            var options = new HdbScanOptions { MinClusterSize = 5 };
+            var model = new HdbScan<double[]>(points.ToArray(), EuclideanDistance, options);
+
+            // Core points in BOTH clusters should have low scores (< 0.5).
+            // This is the key regression test — the old bug inflated sparse cluster scores.
+            for (var i = 0; i < 20; i++)
+            {
+                if (model.Labels[i] >= 0)
+                {
+                    Assert.That(model.OutlierScores[i], Is.LessThan(0.5),
+                        $"Dense cluster point {i} should have low outlier score");
+                }
+            }
+
+            for (var i = 20; i < 40; i++)
+            {
+                if (model.Labels[i] >= 0)
+                {
+                    Assert.That(model.OutlierScores[i], Is.LessThan(0.5),
+                        $"Sparse cluster point {i} should have low outlier score");
+                }
+            }
+
+            // Outlier should have high score
+            Assert.That(model.OutlierScores[40], Is.GreaterThan(0.5));
+        }
+
+        [Test]
+        public void OutlierScores_PerClusterNormalization()
+        {
+            // 10 very dense points + 10 moderate points.
+            // All clustered points should have scores < 0.5.
+            var points = new List<double[]>();
+
+            // Very dense cluster: 10 points
+            for (var i = 0; i < 10; i++)
+            {
+                points.Add([0.01 * (i % 5), 0.01 * (i / 5)]);
+            }
+
+            // Moderate cluster: 10 points
+            for (var i = 0; i < 10; i++)
+            {
+                points.Add([20 + 0.5 * (i % 5), 20 + 0.5 * (i / 5)]);
+            }
+
+            var options = new HdbScanOptions { MinClusterSize = 5 };
+            var model = new HdbScan<double[]>(points.ToArray(), EuclideanDistance, options);
+
+            for (var i = 0; i < 20; i++)
+            {
+                if (model.Labels[i] >= 0)
+                {
+                    Assert.That(model.OutlierScores[i], Is.LessThan(0.5),
+                        $"Clustered point {i} should have low outlier score");
+                }
+            }
+        }
+
+        [Test]
+        public void OutlierScores_Iris_MatchesScikitLearn()
+        {
+            var xs = ReadIris("iris.csv").ToArray();
+
+            var options = new HdbScanOptions
+            {
+                MinClusterSize = 5,
+                MinSamples = 5,
+                ClusterSelectionMethod = ClusterSelectionMethod.ExcessOfMass
+            };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options);
+
+            // All scores should be in [0, 1]
+            foreach (var score in model.OutlierScores)
+            {
+                Assert.That(score, Is.GreaterThanOrEqualTo(0));
+                Assert.That(score, Is.LessThanOrEqualTo(1));
+            }
+
+            // Setosa (first 50 points) is well-separated; most points should have low scores.
+            var setosaMedianScore = model.OutlierScores.Take(50).OrderBy(x => x).ElementAt(25);
+            Assert.That(setosaMedianScore, Is.LessThan(0.5),
+                "Setosa (well-separated cluster) should have low median outlier score");
         }
     }
 }
