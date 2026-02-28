@@ -45,6 +45,9 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Restore dependencies
+        run: dotnet restore HdbScan.Net/HdbScan.Net.csproj
+
       - name: Pack
         run: dotnet pack HdbScan.Net/HdbScan.Net.csproj --configuration Release /p:Version=${{ steps.version.outputs.VERSION }} --output ./nupkg
 
