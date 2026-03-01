@@ -22,10 +22,10 @@ namespace HdbScan.Net
     /// clustering using either the Excess of Mass (EOM) or Leaf method.
     /// </para>
     /// <para>
-    /// Reference: Campello, R.J.G.B., Moulavi, D., Sander, J. (2013).
-    /// "Density-Based Clustering Based on Hierarchical Density Estimates."
-    /// In: Pei, J., Tseng, V.S., Cao, L., Motoda, H., Xu, G. (eds) PAKDD 2013.
-    /// Lecture Notes in Computer Science, vol 7819. Springer, Berlin, Heidelberg.
+    /// Reference: Campello, R.J.G.B., Moulavi, D., Zimek, A., Sander, J. (2015).
+    /// "Hierarchical Density Estimates for Data Clustering, Visualization, and Outlier Detection."
+    /// ACM Trans. Knowl. Discov. Data 10, 1, Article 5 (July 2015).
+    /// https://doi.org/10.1145/2733381
     /// </para>
     /// </remarks>
     public sealed class HdbScan<T>
@@ -85,15 +85,15 @@ namespace HdbScan.Net
 
             var n = points.Count;
 
-            // Algorithm pipeline (Paper, Section 3):
+            // Algorithm pipeline (Campello et al. 2015, ACM TKDD 10(1), doi:10.1145/2733381):
             //
-            //   1. Compute core distances           (Definition 3)
-            //   2. Build mutual reachability graph   (Definition 4)
-            //   3. Compute MST of that graph         (Theorem 1 — equivalent to MST_k)
-            //   4. Build hierarchical clustering     (single-linkage dendrogram)
-            //   5. Condense the dendrogram           (Section 4 — extract condensed tree)
-            //   6. Extract flat clustering           (FOSC framework, Section 5)
-            //   7. Compute outlier scores            (GLOSH — Campello et al. 2015)
+            //   1. Compute core distances           (Definition 3.1)
+            //   2. Build mutual reachability graph   (Definitions 3.2–3.3)
+            //   3. Compute MST of that graph         (Proposition 3.4, Section 3.2)
+            //   4. Build hierarchical clustering     (Algorithm 1, single-linkage dendrogram)
+            //   5. Condense the dendrogram           (Section 3.3, Algorithm 2)
+            //   6. Extract flat clustering           (Section 5.2, Algorithm 3)
+            //   7. Compute outlier scores            (Section 6, Algorithm 4 — GLOSH)
 
             var coreDistances = ComputeCoreDistances(points, distanceMetric, minSamples);
 
@@ -254,7 +254,7 @@ namespace HdbScan.Net
         public bool HasPredictionData => points != null;
 
         /// <summary>
-        /// Paper, Definition 3: core_k(x) = distance to the k-th nearest neighbor (including x).
+        /// Definition 3.1: dcore(xp) = distance from xp to its mpts-nearest neighbor (incl. xp).
         /// After sorting all n distances (where distances[0] = 0 for self), distances[k-1] is
         /// the k-th nearest including self. Matches sklearn: tree.query(X, k=min_samples)[0][:, -1].
         /// </summary>
@@ -279,9 +279,10 @@ namespace HdbScan.Net
         }
 
         /// <summary>
-        /// Paper, Theorem 1: the MST of the mutual reachability graph equals MST_k, the
-        /// "extended minimum spanning tree" that encodes all density-based hierarchical
-        /// clusterings. Built via Prim's algorithm in O(n^2), matching sklearn's generic path.
+        /// Algorithm 1 Step 2 / Proposition 3.4: the MST of the mutual reachability
+        /// graph Gmpts encodes the density-based clustering hierarchy. Single-linkage on
+        /// mutual reachability distances produces all DBSCAN* partitions hierarchically.
+        /// Built via Prim's algorithm in O(n^2).
         /// </summary>
         private static MstEdge[] BuildMst(IReadOnlyList<T> points, Func<T, T, double> dm, double[] coreDistances)
         {
@@ -341,7 +342,7 @@ namespace HdbScan.Net
         }
 
         /// <summary>
-        /// Paper, Definition 4: d_mreach(a, b) = max(core(a), core(b), d(a, b)).
+        /// Definition 3.2: d_mreach(a, b) = max{dcore(a), dcore(b), d(a, b)}.
         /// Effectively "pushes apart" points in sparse regions while preserving distances
         /// in dense regions.
         /// </summary>
@@ -387,8 +388,9 @@ namespace HdbScan.Net
         }
 
         /// <summary>
-        /// Paper, Section 4: walks the dendrogram top-down, pruning splits where a child has
-        /// fewer than minClusterSize points. Uses lambda = 1/distance as the density level.
+        /// Section 3.3 / Algorithm 2: walks the dendrogram top-down, pruning splits
+        /// where a child has fewer than minClusterSize points. Uses lambda = 1/distance as
+        /// the density level.
         ///
         /// At each split:
         ///   - Both children large enough  -> genuine split, two new child clusters
@@ -600,16 +602,16 @@ namespace HdbScan.Net
         }
 
         /// <summary>
-        /// Paper, Section 5 / FOSC framework: selects a flat clustering by maximizing
+        /// Section 5.2 / Algorithm 3: selects a flat clustering by maximizing
         /// total cluster stability subject to the constraint that selected clusters are
         /// non-overlapping (at most one per root-to-leaf path in the condensed tree).
         ///
         /// Stability of cluster C (Equation 3):
-        ///   S(C) = sum over all edges from C of: (lambda_edge - lambda_birth(C)) * edge.Size
+        ///   S(C) = sum_{xj in C} (lambda_max(xj, C) - lambda_min(C))
         ///
-        /// Bottom-up traversal: if a parent's stability exceeds the sum of its children's
-        /// stabilities, select the parent and deselect all descendants. Otherwise, propagate
-        /// the children's combined stability upward. This greedy approach is provably optimal.
+        /// Bottom-up traversal (Equation 5): if a parent's own stability exceeds the sum
+        /// of its children's propagated stabilities, select the parent and deselect all
+        /// descendants. Otherwise, propagate the children's combined stability upward.
         /// </summary>
         private static HashSet<int> SelectClustersEom(
             Dictionary<int, List<CondensedTreeEdge>> edgesBySource,
@@ -731,7 +733,8 @@ namespace HdbScan.Net
 
         /// <summary>
         /// GLOSH (Global-Local Outlier Score from Hierarchies).
-        /// Campello et al. (2015), "A framework for optimal selection of clusters."
+        /// Campello et al. (2015), "Hierarchical Density Estimates for Data Clustering,
+        /// Visualization, and Outlier Detection." ACM Trans. Knowl. Discov. Data.
         ///
         /// For each point: score = 1 - lambda_p / lambda_max(cluster).
         /// lambda_max is propagated upward so each cluster's "death" reflects the peak
