@@ -1,5 +1,7 @@
 # HdbScan.Net
 
+[![NuGet](https://img.shields.io/nuget/v/HdbScan.Net.svg)](https://www.nuget.org/packages/HdbScan.Net)
+
 A .NET implementation of HDBSCAN (Hierarchical Density-Based Spatial Clustering of Applications with Noise).
 
 HDBSCAN extends DBSCAN by building a hierarchy of clusterings at all density levels and extracting a flat clustering based on cluster stability. Unlike k-means or GMM, it does not require specifying the number of clusters and can identify noise points.
