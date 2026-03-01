@@ -66,18 +66,42 @@ var model = new HdbScan<double[]>(points, euclidean, options, predictionData: tr
 var (label, probability) = model.PredictWithProbability(newPoint);
 ```
 
+### Outlier detection
+
+Each point receives a GLOSH outlier score between 0 and 1. Higher values indicate stronger outliers:
+
+```csharp
+for (var i = 0; i < model.OutlierScores.Count; i++)
+{
+    if (model.OutlierScores[i] > 0.9)
+        Console.WriteLine($"Point {i} is a strong outlier (score {model.OutlierScores[i]:F3})");
+}
+```
+
 ### Options
 
 | Property | Default | Description |
 |---|---|---|
 | `MinClusterSize` | 5 | Minimum number of points to form a cluster (>= 2) |
-| `MinSamples` | 0 (= MinClusterSize) | Number of neighbors for core point definition |
+| `MinSamples` | `MinClusterSize` | Number of neighbors for core point definition, including the point itself (>= 2). See [sklearn compatibility](#sklearn-compatibility). |
 | `ClusterSelectionMethod` | `ExcessOfMass` | `ExcessOfMass` for stable clusters, `Leaf` for fine-grained clusters |
 | `AllowSingleCluster` | `false` | Whether to allow all points in a single cluster |
 
+## sklearn compatibility
+
+This implementation follows the **sklearn.cluster.HDBSCAN** convention where `MinSamples` includes the point itself. Results are validated against scikit-learn's output on multiple datasets.
+
+If you are migrating from the **scikit-learn-contrib/hdbscan** library (which excludes self from the count), add 1 to your `min_samples` value:
+
+```csharp
+// scikit-learn-contrib/hdbscan: min_samples=4
+// sklearn.cluster.HDBSCAN / HdbScan.Net: MinSamples = 5
+var options = new HdbScanOptions { MinSamples = 5 };
+```
+
 ## Reference
 
-Campello, R.J.G.B., Moulavi, D., Sander, J. (2013). "Density-Based Clustering Based on Hierarchical Density Estimates." PAKDD 2013. Lecture Notes in Computer Science, vol 7819. Springer.
+Campello, R.J.G.B., Moulavi, D., Zimek, A., Sander, J. (2015). "Hierarchical Density Estimates for Data Clustering, Visualization, and Outlier Detection." ACM Trans. Knowl. Discov. Data 10, 1, Article 5 (July 2015). https://doi.org/10.1145/2733381
 
 ## License
 
