@@ -407,7 +407,7 @@ namespace HdbScan.Net
             var condensed = new List<CondensedTreeEdge>();
 
             // Map each dendrogram node to (left, right, lambda, size).
-            // Lambda = 1/(distance + epsilon) converts distance to density level.
+            // Lambda = 1/(distance + epsilon) converts distance to density level (Section 5.1: λ = 1/ε).
             var nodeInfo = new Dictionary<int, (int Left, int Right, double Lambda, int Size)>();
             var nodeLabel = n;
             foreach (var node in singleLinkageTree)
@@ -631,7 +631,8 @@ namespace HdbScan.Net
                 {
                     foreach (var edge in edges)
                     {
-                        stab += (edge.Lambda - birthLambda) * edge.Size;
+                        // Equation (3): S(Ci) = Σ (λ_max(xj,Ci) - λ_min(Ci)) · |points|
+                    stab += (edge.Lambda - birthLambda) * edge.Size;
                     }
                 }
 
@@ -776,8 +777,9 @@ namespace HdbScan.Net
                 }
             }
 
-            // Propagate max lambda from children to parents. Children have higher IDs
-            // than parents, so reverse-sorted order guarantees correct propagation.
+            // Algorithm 4 Step 1: propagate ε_max from children to parents.
+            // Children have higher IDs than parents, so reverse-sorted order
+            // guarantees correct propagation.
             var clusterIds = new List<int>(deaths.Keys);
             clusterIds.Sort();
             for (var i = clusterIds.Count - 1; i >= 0; i--)
@@ -803,7 +805,8 @@ namespace HdbScan.Net
                     var clusterDeath = deaths.TryGetValue(edge.SourceCluster, out var d) ? d : 1.0;
                     if (clusterDeath > 0)
                     {
-                        scores[i] = Math.Max(0, Math.Min(1.0, 1.0 - edge.Lambda / clusterDeath));
+                        // Equation (8): GLOSH(xp) = 1 - ε_max(xp) / ε_max(Ci)
+                    scores[i] = Math.Max(0, Math.Min(1.0, 1.0 - edge.Lambda / clusterDeath));
                     }
                 }
             }
