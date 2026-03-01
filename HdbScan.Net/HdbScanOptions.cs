@@ -26,7 +26,7 @@ namespace HdbScan.Net
     public sealed class HdbScanOptions
     {
         private int minClusterSize;
-        private int minSamples;
+        private int? minSamples;
         private ClusterSelectionMethod clusterSelectionMethod;
         private bool allowSingleCluster;
 
@@ -36,7 +36,7 @@ namespace HdbScan.Net
         public HdbScanOptions()
         {
             minClusterSize = 5;
-            minSamples = 0;
+            minSamples = null;
             clusterSelectionMethod = ClusterSelectionMethod.ExcessOfMass;
             allowSingleCluster = false;
         }
@@ -60,18 +60,24 @@ namespace HdbScan.Net
         }
 
         /// <summary>
-        /// The number of samples in a neighborhood for a point to be considered a core point.
-        /// If set to 0, it defaults to <see cref="MinClusterSize"/>.
+        /// The number of samples in a neighborhood for a point to be considered a core point,
+        /// including the point itself. Must be at least 2.
+        /// If not set, defaults to <see cref="MinClusterSize"/>.
         /// </summary>
+        /// <remarks>
+        /// This follows the sklearn.cluster.HDBSCAN convention where min_samples includes the
+        /// point itself. For equivalent results with the scikit-learn-contrib/hdbscan library
+        /// (which excludes self), add 1 to your value.
+        /// </remarks>
         public int MinSamples
         {
-            get => minSamples > 0 ? minSamples : minClusterSize;
+            get => minSamples ?? minClusterSize;
 
             set
             {
-                if (value < 0)
+                if (value < 2)
                 {
-                    throw new ArgumentOutOfRangeException(nameof(value), "The minimum samples must be non-negative.");
+                    throw new ArgumentOutOfRangeException(nameof(value), "The minimum samples must be at least 2.");
                 }
 
                 minSamples = value;

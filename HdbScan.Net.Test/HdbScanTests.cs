@@ -548,6 +548,16 @@ namespace HdbScan.Net.Test
             {
                 var options = new HdbScanOptions { MinSamples = -1 };
             });
+
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+            {
+                var options = new HdbScanOptions { MinSamples = 0 };
+            });
+
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+            {
+                var options = new HdbScanOptions { MinSamples = 1 };
+            });
         }
 
         [Test]
@@ -722,6 +732,53 @@ namespace HdbScan.Net.Test
                         $"Clustered point {i} should have low outlier score");
                 }
             }
+        }
+
+        /// <summary>
+        /// Validates that MinSamples includes the point itself, matching sklearn's convention.
+        /// sklearn's HDBSCAN counts the point itself as one of its min_samples neighbors
+        /// (unlike scikit-learn-contrib/hdbscan which does NOT include self).
+        ///
+        /// This test uses a configuration where the two interpretations produce different
+        /// results: with self-inclusion (correct) → 0 noise; without self → point 118
+        /// becomes noise. This catches an off-by-one error in core distance computation.
+        ///
+        /// Python reference (scikit-learn 1.3+):
+        ///   df = pd.read_csv("iris_kpca_poly_d2c1.csv")
+        ///   X = df[["x", "y"]].values
+        ///   hdb = HDBSCAN(min_cluster_size=5, min_samples=5, cluster_selection_method='eom')
+        ///   labels = hdb.fit_predict(X)
+        ///   # 2 clusters, 0 noise, labels[118] != -1
+        ///
+        ///   # Without self (equivalent to min_samples=6 in sklearn):
+        ///   hdb2 = HDBSCAN(min_cluster_size=5, min_samples=6, cluster_selection_method='eom')
+        ///   labels2 = hdb2.fit_predict(X)
+        ///   # 2 clusters, 1 noise at index 118
+        /// </summary>
+        [Test]
+        public void IrisKpca_MinSamplesIncludesSelf_MatchesScikitLearn()
+        {
+            var xs = ReadXY("iris_kpca_poly_d2c1.csv").ToArray();
+
+            var options = new HdbScanOptions
+            {
+                MinClusterSize = 5,
+                MinSamples = 5,
+                ClusterSelectionMethod = ClusterSelectionMethod.ExcessOfMass
+            };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options);
+
+            Assert.That(model.ClusterCount, Is.EqualTo(2), "Expected 2 clusters");
+
+            var noiseCount = model.Labels.Count(l => l == -1);
+            Assert.That(noiseCount, Is.EqualTo(0),
+                "Expected 0 noise points (if min_samples includes self). " +
+                "If this fails with 1 noise point at index 118, core distances are computed " +
+                "without self-inclusion, which does not match sklearn.");
+
+            // Point 118 is the canary: it becomes noise if self is excluded from count.
+            Assert.That(model.Labels[118], Is.Not.EqualTo(-1),
+                "Point 118 should NOT be noise when min_samples includes self (matching sklearn)");
         }
 
         /// <summary>
