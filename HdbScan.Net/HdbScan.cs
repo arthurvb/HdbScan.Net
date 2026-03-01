@@ -73,12 +73,8 @@ namespace HdbScan.Net
                 labels = new int[points.Count];
                 probabilities = new double[points.Count];
                 outlierScores = new double[points.Count];
-                for (var i = 0; i < points.Count; i++)
-                {
-                    labels[i] = -1;
-                    probabilities[i] = 0;
-                    outlierScores[i] = 1;
-                }
+                Array.Fill(labels, -1);
+                Array.Fill(outlierScores, 1.0);
                 clusterCount = 0;
                 return;
             }
@@ -89,15 +85,16 @@ namespace HdbScan.Net
             //
             //   1. Compute core distances           (Definition 3.1)
             //   2. Build mutual reachability graph   (Definitions 3.2–3.3)
-            //   3. Compute MST of that graph         (Proposition 3.4, Section 3.2)
+            //   3. Compute MST (Minimum Spanning Tree) of that graph (Proposition 3.4, Section 3.2)
             //   4. Build hierarchical clustering     (Algorithm 1, single-linkage dendrogram)
             //   5. Condense the dendrogram           (Section 3.3, Algorithm 2)
             //   6. Extract flat clustering           (Section 5.2, Algorithm 3)
             //   7. Compute outlier scores            (Section 6, Algorithm 4 — GLOSH)
 
-            var coreDistances = ComputeCoreDistances(points, distanceMetric, minSamples);
+            var distMatrix = ComputeDistanceMatrix(points, distanceMetric);
+            var coreDistances = ComputeCoreDistances(distMatrix, n, minSamples);
 
-            var mst = BuildMst(points, distanceMetric, coreDistances);
+            var mst = BuildMst(distMatrix, n, coreDistances);
 
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             var singleLinkageTree = BuildSingleLinkageTree(mst, n);
@@ -254,25 +251,60 @@ namespace HdbScan.Net
         public bool HasPredictionData => points != null;
 
         /// <summary>
-        /// Definition 3.1: dcore(xp) = distance from xp to its mpts-nearest neighbor (incl. xp).
-        /// After sorting all n distances (where distances[0] = 0 for self), distances[k-1] is
-        /// the k-th nearest including self. Matches sklearn: tree.query(X, k=min_samples)[0][:, -1].
+        /// Computes the full n×n pairwise distance matrix, exploiting symmetry (only calls
+        /// dm(i,j) for i &lt; j, then mirrors). Stored as a flat double[] in row-major order
+        /// for cache-friendly access. Diagonal entries are 0.
         /// </summary>
-        private static double[] ComputeCoreDistances(IReadOnlyList<T> points, Func<T, T, double> dm, int k)
+        private static double[] ComputeDistanceMatrix(IReadOnlyList<T> points, Func<T, T, double> dm)
         {
             var n = points.Count;
+            var matrix = new double[n * n];
+
+            for (var i = 0; i < n; i++)
+            {
+                for (var j = i + 1; j < n; j++)
+                {
+                    var d = dm(points[i], points[j]);
+                    matrix[i * n + j] = d;
+                    matrix[j * n + i] = d;
+                }
+            }
+
+            return matrix;
+        }
+
+        /// <summary>
+        /// Definition 3.1: dcore(xp) = distance from xp to its mpts-nearest neighbor (incl. xp).
+        /// Uses a bounded max-heap (PriorityQueue with reversed comparison, size k) to find
+        /// the k-th smallest distance in O(n log k) per point instead of O(n log n) via full sort.
+        /// Matches sklearn: tree.query(X, k=min_samples)[0][:, -1].
+        /// </summary>
+        private static double[] ComputeCoreDistances(double[] distMatrix, int n, int k)
+        {
             var coreDistances = new double[n];
             k = Math.Min(k, n);
 
-            var distances = new double[n];
+            // Max-heap of size k: root is always the largest among the k smallest distances seen so far.
+            var heap = new PriorityQueue<byte, double>(k, Comparer<double>.Create((a, b) => b.CompareTo(a)));
+
             for (var i = 0; i < n; i++)
             {
+                heap.Clear();
+                var rowOffset = i * n;
                 for (var j = 0; j < n; j++)
                 {
-                    distances[j] = i == j ? 0 : dm(points[i], points[j]);
+                    var d = i == j ? 0.0 : distMatrix[rowOffset + j];
+                    if (heap.Count < k)
+                    {
+                        heap.Enqueue(0, d);
+                    }
+                    else
+                    {
+                        heap.EnqueueDequeue(0, d);
+                    }
                 }
-                Array.Sort(distances);
-                coreDistances[i] = distances[k - 1];
+                heap.TryPeek(out _, out var kthSmallest);
+                coreDistances[i] = kthSmallest;
             }
 
             return coreDistances;
@@ -284,24 +316,20 @@ namespace HdbScan.Net
         /// mutual reachability distances produces all DBSCAN* partitions hierarchically.
         /// Built via Prim's algorithm in O(n^2).
         /// </summary>
-        private static MstEdge[] BuildMst(IReadOnlyList<T> points, Func<T, T, double> dm, double[] coreDistances)
+        private static MstEdge[] BuildMst(double[] distMatrix, int n, double[] coreDistances)
         {
-            var n = points.Count;
             var inMst = new bool[n];
             var minDist = new double[n];
             var minEdge = new int[n];
-            var edges = new List<MstEdge>(n - 1);
+            var edges = new MstEdge[n - 1];
 
-            for (var i = 0; i < n; i++)
-            {
-                minDist[i] = double.MaxValue;
-                minEdge[i] = -1;
-            }
+            Array.Fill(minDist, double.MaxValue);
+            Array.Fill(minEdge, -1);
 
             inMst[0] = true;
             for (var j = 1; j < n; j++)
             {
-                var d = MutualReachabilityDistance(points, dm, coreDistances, 0, j);
+                var d = MutualReachabilityDistance(distMatrix, n, coreDistances, 0, j);
                 minDist[j] = d;
                 minEdge[j] = 0;
             }
@@ -322,13 +350,13 @@ namespace HdbScan.Net
                 if (minIdx == -1) break;
 
                 inMst[minIdx] = true;
-                edges.Add(new MstEdge(minEdge[minIdx], minIdx, minVal));
+                edges[step] = new MstEdge(minEdge[minIdx], minIdx, minVal);
 
                 for (var j = 0; j < n; j++)
                 {
                     if (!inMst[j])
                     {
-                        var d = MutualReachabilityDistance(points, dm, coreDistances, minIdx, j);
+                        var d = MutualReachabilityDistance(distMatrix, n, coreDistances, minIdx, j);
                         if (d < minDist[j])
                         {
                             minDist[j] = d;
@@ -338,7 +366,7 @@ namespace HdbScan.Net
                 }
             }
 
-            return edges.ToArray();
+            return edges;
         }
 
         /// <summary>
@@ -346,10 +374,10 @@ namespace HdbScan.Net
         /// Effectively "pushes apart" points in sparse regions while preserving distances
         /// in dense regions.
         /// </summary>
-        private static double MutualReachabilityDistance(IReadOnlyList<T> points, Func<T, T, double> dm,
+        private static double MutualReachabilityDistance(double[] distMatrix, int n,
             double[] coreDistances, int i, int j)
         {
-            var dist = dm(points[i], points[j]);
+            var dist = distMatrix[i * n + j];
             return Math.Max(Math.Max(coreDistances[i], coreDistances[j]), dist);
         }
 
@@ -509,7 +537,7 @@ namespace HdbScan.Net
         {
             var labels = new int[n];
             var probabilities = new double[n];
-            for (var i = 0; i < n; i++) labels[i] = -1;
+            Array.Fill(labels, -1);
 
             if (condensedTree.Count == 0)
             {
@@ -748,7 +776,7 @@ namespace HdbScan.Net
         private static double[] ComputeOutlierScores(List<CondensedTreeEdge> condensedTree, int n)
         {
             var scores = new double[n];
-            for (var i = 0; i < n; i++) scores[i] = 1.0;
+            Array.Fill(scores, 1.0);
 
             if (condensedTree.Count == 0) return scores;
 
