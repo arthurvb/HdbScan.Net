@@ -707,8 +707,11 @@ namespace HdbScan.Net
                 }
             }
 
-            // Process non-leaf clusters bottom-up. A cluster is ready once all
-            // its children have been processed; re-enqueue if not yet ready.
+            // Process non-leaf clusters bottom-up (Equation 5). A cluster is ready
+            // once all its children have been processed; re-enqueue if not yet ready.
+            // When allowSingleCluster is false, exclude the root (id = n) from the
+            // comparison so it cannot deselect all descendants. This matches sklearn:
+            // node_list = sorted(stability.keys(), reverse=True)[:-1]  # exclude root
             var queue = new Queue<int>(clusters.Where(c => !processed.Contains(c)));
             while (queue.Count > 0)
             {
@@ -717,22 +720,30 @@ namespace HdbScan.Net
 
                 if (children.All(processed.Contains))
                 {
-                    var childStability = children.Sum(c => stability[c]);
-                    if (stability[cluster] > childStability)
+                    if (cluster == n && !allowSingleCluster)
                     {
-                        // Parent wins: select it, deselect all descendants.
-                        foreach (var child in children)
-                        {
-                            RemoveDescendants(child);
-                        }
-                        selected.Add(cluster);
+                        // Root excluded from comparison: just propagate children upward.
+                        processed.Add(cluster);
                     }
                     else
                     {
-                        // Children win: propagate their combined stability upward.
-                        stability[cluster] = childStability;
+                        var childStability = children.Sum(c => stability[c]);
+                        if (childStability > stability[cluster])
+                        {
+                            // Children win: propagate their combined stability upward.
+                            stability[cluster] = childStability;
+                        }
+                        else
+                        {
+                            // Parent wins (or tie): select it, deselect all descendants.
+                            foreach (var child in children)
+                            {
+                                RemoveDescendants(child);
+                            }
+                            selected.Add(cluster);
+                        }
+                        processed.Add(cluster);
                     }
-                    processed.Add(cluster);
                 }
                 else
                 {
@@ -740,8 +751,8 @@ namespace HdbScan.Net
                 }
             }
 
-            // Handle the root cluster (id = n). If it's the only selection,
-            // respect the allowSingleCluster setting.
+            // Remove the root cluster from the selection — it is either excluded
+            // (allowSingleCluster=false) or kept only if it is the sole selection.
             if (selected.Contains(n))
             {
                 if (selected.Count == 1)

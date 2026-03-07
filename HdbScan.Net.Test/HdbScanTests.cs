@@ -220,6 +220,61 @@ namespace HdbScan.Net.Test
             }
         }
 
+        /// <summary>
+        /// Validates HDBSCAN on the pendigits (8x8 handwritten digits) dataset against scikit-learn.
+        /// Python reference (scikit-learn 1.3+):
+        ///   from sklearn.datasets import load_digits
+        ///   from sklearn.cluster import HDBSCAN
+        ///   X = load_digits().data  # 1797 samples, 64 features
+        ///   hdb = HDBSCAN(min_cluster_size=15, min_samples=15, cluster_selection_method='eom')
+        ///   labels = hdb.fit_predict(X)
+        /// Expected result:
+        ///   - 10 clusters, 894 noise points
+        ///   - Cluster sizes (descending): [171, 146, 127, 119, 99, 83, 64, 42, 35, 17]
+        /// </summary>
+        [Test]
+        public void Pendigits_MatchesScikitLearn()
+        {
+            var xs = ReadCsv("pendigits.csv", columns: 64).ToArray();
+            Assert.That(xs.Length, Is.EqualTo(1797), "Pendigits dataset should have 1797 samples");
+
+            var options = new HdbScanOptions
+            {
+                MinClusterSize = 15,
+                MinSamples = 15,
+                ClusterSelectionMethod = ClusterSelectionMethod.ExcessOfMass
+            };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options);
+
+            // scikit-learn produces 10 clusters with 894 noise points
+            Assert.That(model.ClusterCount, Is.EqualTo(10), "Expected 10 clusters");
+
+            var noiseCount = model.Labels.Count(l => l == -1);
+            Assert.That(noiseCount, Is.EqualTo(894), "Expected 894 noise points");
+
+            // Verify cluster size distribution matches Python
+            var clusterSizes = model.Labels
+                .Where(l => l >= 0)
+                .GroupBy(l => l)
+                .Select(g => g.Count())
+                .OrderByDescending(c => c)
+                .ToArray();
+
+            var expectedSizes = new[] { 171, 146, 127, 119, 99, 83, 64, 42, 35, 17 };
+            Assert.That(clusterSizes, Is.EqualTo(expectedSizes),
+                "Cluster size distribution should match scikit-learn");
+        }
+
+        private static IEnumerable<double[]> ReadCsv(string filename, int columns)
+        {
+            var path = Path.Combine("dataset", filename);
+            foreach (var line in File.ReadLines(path).Skip(1))
+            {
+                var values = line.Split(',').Take(columns).Select(double.Parse).ToArray();
+                yield return values;
+            }
+        }
+
         private static IEnumerable<double[]> ReadIris(string filename)
         {
             var path = Path.Combine("dataset", filename);
