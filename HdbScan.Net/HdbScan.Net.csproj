@@ -22,4 +22,8 @@
     <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="HdbScan.Net.Test" />
+  </ItemGroup>
+
 </Project>
