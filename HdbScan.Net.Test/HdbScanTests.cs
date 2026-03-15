@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using NUnit.Framework;
@@ -270,7 +271,7 @@ namespace HdbScan.Net.Test
             var path = Path.Combine("dataset", filename);
             foreach (var line in File.ReadLines(path).Skip(1))
             {
-                var values = line.Split(',').Take(columns).Select(double.Parse).ToArray();
+                var values = line.Split(',').Take(columns).Select(v => double.Parse(v, CultureInfo.InvariantCulture)).ToArray();
                 yield return values;
             }
         }
@@ -280,7 +281,7 @@ namespace HdbScan.Net.Test
             var path = Path.Combine("dataset", filename);
             foreach (var line in File.ReadLines(path).Skip(1))
             {
-                var values = line.Split(',').Take(4).Select(double.Parse).ToArray();
+                var values = line.Split(',').Take(4).Select(v => double.Parse(v, CultureInfo.InvariantCulture)).ToArray();
                 yield return values;
             }
         }
@@ -290,7 +291,7 @@ namespace HdbScan.Net.Test
             var path = Path.Combine("dataset", filename);
             foreach (var line in File.ReadLines(path).Skip(1))
             {
-                var values = line.Split(',').Take(2).Select(double.Parse).ToArray();
+                var values = line.Split(',').Take(2).Select(v => double.Parse(v, CultureInfo.InvariantCulture)).ToArray();
                 yield return values;
             }
         }
