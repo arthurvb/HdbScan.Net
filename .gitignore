@@ -4,3 +4,4 @@ obj/
 *.user
 *.pdf
 .vs/
+.DS_Store
