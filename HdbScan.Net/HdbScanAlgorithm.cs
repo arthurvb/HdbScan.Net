@@ -189,13 +189,38 @@ namespace HdbScan.Net
             var relabel = new Dictionary<int, int> { [root] = n };
             var nextCondensedLabel = n + 1;
 
-            void ProcessNode(int node, int parent)
+            // Records all leaf points under a too-small subtree as departing at the split's lambda.
+            void FallOutPoints(int startNode, double lambda, int parentCluster)
             {
+                var pending = new Stack<int>();
+                pending.Push(startNode);
+                while (pending.Count > 0)
+                {
+                    var current = pending.Pop();
+                    if (current < n)
+                    {
+                        condensed.Add(new CondensedTreeEdge(parentCluster, current, lambda, 1));
+                    }
+                    else
+                    {
+                        var (left, right, _, _) = nodeInfo[current];
+                        pending.Push(right);
+                        pending.Push(left);
+                    }
+                }
+            }
+
+            var stack = new Stack<(int Node, int Parent)>();
+            stack.Push((root, root));
+            while (stack.Count > 0)
+            {
+                var (node, parent) = stack.Pop();
+
                 if (node < n)
                 {
                     var lambda = nodeInfo.ContainsKey(parent) ? nodeInfo[parent].Lambda : 0;
                     condensed.Add(new CondensedTreeEdge(relabel[parent], node, lambda, 1));
-                    return;
+                    continue;
                 }
 
                 var (left, right, lambdaVal, size) = nodeInfo[node];
@@ -209,21 +234,21 @@ namespace HdbScan.Net
                     relabel[right] = nextCondensedLabel++;
                     condensed.Add(new CondensedTreeEdge(relabel[parent], relabel[left], lambdaVal, leftSize));
                     condensed.Add(new CondensedTreeEdge(relabel[parent], relabel[right], lambdaVal, rightSize));
-                    ProcessNode(left, left);
-                    ProcessNode(right, right);
+                    stack.Push((right, right));
+                    stack.Push((left, left));
                 }
                 else if (leftSize >= minClusterSize)
                 {
                     // Left survives; right's points fall out of the current cluster.
                     relabel[left] = relabel[parent];
                     FallOutPoints(right, lambdaVal, relabel[parent]);
-                    ProcessNode(left, parent);
+                    stack.Push((left, parent));
                 }
                 else if (rightSize >= minClusterSize)
                 {
                     relabel[right] = relabel[parent];
                     FallOutPoints(left, lambdaVal, relabel[parent]);
-                    ProcessNode(right, parent);
+                    stack.Push((right, parent));
                 }
                 else
                 {
@@ -233,22 +258,6 @@ namespace HdbScan.Net
                 }
             }
 
-            // Records all leaf points under a too-small subtree as departing at the split's lambda.
-            void FallOutPoints(int node, double lambda, int parentCluster)
-            {
-                if (node < n)
-                {
-                    condensed.Add(new CondensedTreeEdge(parentCluster, node, lambda, 1));
-                }
-                else
-                {
-                    var (left, right, _, _) = nodeInfo[node];
-                    FallOutPoints(left, lambda, parentCluster);
-                    FallOutPoints(right, lambda, parentCluster);
-                }
-            }
-
-            ProcessNode(root, root);
             return condensed;
         }
 
@@ -656,11 +665,16 @@ namespace HdbScan.Net
 
             public int Find(int x)
             {
-                if (parent[x] != x)
+                var root = x;
+                while (parent[root] != root)
+                    root = parent[root];
+                while (parent[x] != root)
                 {
-                    parent[x] = Find(parent[x]); // Path compression.
+                    var next = parent[x];
+                    parent[x] = root;
+                    x = next;
                 }
-                return parent[x];
+                return root;
             }
 
             /// <summary>
