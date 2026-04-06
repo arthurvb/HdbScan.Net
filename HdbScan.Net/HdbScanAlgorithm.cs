@@ -476,8 +476,7 @@ namespace HdbScan.Net
                 }
             }
 
-            // Process non-leaf clusters bottom-up (Equation 5). A cluster is ready
-            // once all its children have been processed; re-enqueue if not yet ready.
+            // Process non-leaf clusters bottom-up (Equation 5).
             // When allowSingleCluster is false, exclude the root (id = n) from the
             // comparison so it cannot deselect all descendants. This matches sklearn:
             // node_list = sorted(stability.keys(), reverse=True)[:-1]  # exclude root
@@ -487,6 +486,9 @@ namespace HdbScan.Net
                 var cluster = queue.Dequeue();
                 var children = childClusters[cluster];
 
+                // Bottom-up order is not enforced by sorting; instead, a cluster is
+                // re-enqueued (below) if its children haven't been processed yet.
+                // This guarantees children are always handled before their parent.
                 if (children.All(processed.Contains))
                 {
                     if (cluster == n && !allowSingleCluster)
