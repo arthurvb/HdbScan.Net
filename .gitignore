@@ -5,3 +5,4 @@ obj/
 *.pdf
 .vs/
 .DS_Store
+.idea
