@@ -210,6 +210,8 @@ namespace HdbScan.Net
                 }
             }
 
+            // Parent tracks the current cluster identity: (child, child) = new cluster,
+            // (child, parent) = continuation of the parent cluster (no genuine split).
             var stack = new Stack<(int Node, int Parent)>();
             stack.Push((root, root));
             while (stack.Count > 0)
@@ -246,6 +248,7 @@ namespace HdbScan.Net
                 }
                 else if (rightSize >= minClusterSize)
                 {
+                    // Right survives; left's points fall out of the current cluster.
                     relabel[right] = relabel[parent];
                     FallOutPoints(left, lambdaVal, relabel[parent]);
                     stack.Push((right, parent));
@@ -261,6 +264,9 @@ namespace HdbScan.Net
             return condensed;
         }
 
+        /// <summary>
+        /// Indexes condensed tree edges by source cluster and by target for O(1) lookups.
+        /// </summary>
         private static (Dictionary<int, List<CondensedTreeEdge>> EdgesBySource, Dictionary<int, CondensedTreeEdge> EdgeByTarget)
             BuildCondensedTreeIndex(List<CondensedTreeEdge> condensedTree)
         {
@@ -295,6 +301,7 @@ namespace HdbScan.Net
 
             var (edgesBySource, edgeByTarget) = BuildCondensedTreeIndex(condensedTree);
 
+            // All internal nodes that appear as parents = the set of clusters in the condensed tree.
             var clusters = edgesBySource.Keys.ToHashSet();
 
             if (clusters.Count == 1 && !allowSingleCluster)
@@ -330,10 +337,9 @@ namespace HdbScan.Net
                 return (labels, probabilities, 0);
             }
 
-            // Max lambda from the selected cluster's direct point edges, used to normalize
-            // membership probabilities. Points from descendant sub-clusters (which may have
-            // higher lambdas) get clamped to 1.0 — they are the most central cluster members.
-            // Matches sklearn's _get_probabilities behavior.
+            // Max lambda across all edges (point + child cluster splits) for each selected
+            // cluster, used to normalize membership probabilities. This matches sklearn's
+            // max_lambdas() in _tree.pyx which considers all edges, not just point edges.
             var clusterMaxLambda = new Dictionary<int, double>();
             foreach (var cluster in selectedClusters)
             {
@@ -342,7 +348,7 @@ namespace HdbScan.Net
                 {
                     foreach (var edge in edges)
                     {
-                        if (edge.Target < n && edge.Lambda > maxLambda)
+                        if (edge.Lambda > maxLambda)
                         {
                             maxLambda = edge.Lambda;
                         }
@@ -351,6 +357,7 @@ namespace HdbScan.Net
                 clusterMaxLambda[cluster] = maxLambda;
             }
 
+            // Map internal cluster IDs to 0-based output labels.
             var clusterToLabel = selectedClusters.Select((c, i) => (c, i)).ToDictionary(x => x.c, x => x.i);
 
             // Assign each point to the nearest selected ancestor in the condensed tree.
@@ -408,14 +415,17 @@ namespace HdbScan.Net
                 {
                     foreach (var edge in edges)
                     {
-                        // Equation (3): S(Ci) = Σ (λ_max(xj,Ci) - λ_min(Ci)) · |points|
-                    stab += (edge.Lambda - birthLambda) * edge.Size;
+                        // Equation (3): S(Ci) = Σ (λ_max(xj,Ci) - λ_min(Ci)).
+                        // edge.Size groups points that share the same departure lambda,
+                        // so × size is equivalent to summing over individual points.
+                        stab += (edge.Lambda - birthLambda) * edge.Size;
                     }
                 }
 
                 stability[cluster] = Math.Max(0, stab);
             }
 
+            // Build parent → child-cluster mapping (ignoring point edges).
             var childClusters = new Dictionary<int, List<int>>();
             foreach (var cluster in clusters)
             {
@@ -540,6 +550,7 @@ namespace HdbScan.Net
 
             if (condensedTree.Count == 0) return scores;
 
+            // deaths[cluster] = max lambda seen among its child edges (the cluster's "death" density).
             var deaths = new Dictionary<int, double>();
             var parentOf = new Dictionary<int, int>();
             var pointEdge = new Dictionary<int, CondensedTreeEdge>();
