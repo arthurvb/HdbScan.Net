@@ -184,7 +184,9 @@ namespace HdbScan.Net
                 nodeLabel++;
             }
 
-            // Relabel clusters in the condensed tree starting from n (the root).
+            // The last merge in the dendrogram joins the final two components into a
+            // single tree, so its label (n + (n-1) - 1 = 2n-2) is always the root.
+            // nodeLabel was incremented once per merge, so nodeLabel - 1 points to it.
             var root = nodeLabel - 1;
             var relabel = new Dictionary<int, int> { [root] = n };
             var nextCondensedLabel = n + 1;
@@ -197,6 +199,8 @@ namespace HdbScan.Net
                 while (pending.Count > 0)
                 {
                     var current = pending.Pop();
+                    // Leaf point (index < n) → emit as a fallen-out point edge.
+                    // Internal node (index >= n) → descend into its children.
                     if (current < n)
                     {
                         condensed.Add(new CondensedTreeEdge(parentCluster, current, lambda, 1));
@@ -218,6 +222,9 @@ namespace HdbScan.Net
             {
                 var (node, parent) = stack.Pop();
 
+                // Leaf point (index < n): this point reached the stack without being
+                // part of a large-enough cluster split — record it departing at
+                // the parent cluster's lambda.
                 if (node < n)
                 {
                     var lambda = nodeInfo.ContainsKey(parent) ? nodeInfo[parent].Lambda : 0;
@@ -225,7 +232,10 @@ namespace HdbScan.Net
                     continue;
                 }
 
+                // Internal node (index >= n): inspect its children to decide
+                // whether this is a genuine split or a continuation.
                 var (left, right, lambdaVal, size) = nodeInfo[node];
+                // A leaf child (< n) has size 1; an internal child's size is stored in nodeInfo.
                 var leftSize = left < n ? 1 : nodeInfo[left].Size;
                 var rightSize = right < n ? 1 : nodeInfo[right].Size;
 
@@ -621,8 +631,19 @@ namespace HdbScan.Net
         //   MstEdge[]  ->  SingleLinkageNode[]  ->  List<CondensedTreeEdge>
         //   (MST)          (dendrogram)              (condensed tree)
         //
-        // Node ID convention throughout: points are 0..n-1, internal/cluster nodes are n+.
-        // This matches scipy's linkage matrix format and sklearn's condensed tree layout.
+        // Node ID convention (used throughout the entire pipeline):
+        //
+        //   index < n   →  leaf point     (one of the n original data points)
+        //   index >= n  →  internal node  (a merge/cluster node in the dendrogram)
+        //
+        // The dendrogram's i-th merge creates internal node (n + i). For example,
+        // with 5 data points (n=5): points are 0-4, and the first merge is node 5,
+        // the second is node 6, etc. The root is always (2n - 2).
+        //
+        // The "node < n" guard appears wherever the code must distinguish between
+        // descending further into the tree (internal node) vs. acting on an actual
+        // data point (leaf). This convention matches scipy's linkage matrix format
+        // and sklearn's condensed tree layout.
         // ================================================================================
 
         internal readonly struct MstEdge(int a, int b, double distance)
