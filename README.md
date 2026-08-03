@@ -101,6 +101,10 @@ If you are migrating from the **scikit-learn-contrib/hdbscan** library (which ex
 var options = new HdbScanOptions { MinSamples = 5 };
 ```
 
+## A note on AI assistance
+
+This library was developed with the help of AI (Claude). A human was in the loop for design decisions and review, and correctness is not taken on faith: the implementation follows the original HDBSCAN* paper and its results are validated against scikit-learn's `HDBSCAN` output on multiple datasets (see the test suite). If you spot anything odd, please open an issue — bug reports are very welcome.
+
 ## Reference
 
 Campello, R.J.G.B., Moulavi, D., Zimek, A., Sander, J. (2015). "Hierarchical Density Estimates for Data Clustering, Visualization, and Outlier Detection." ACM Trans. Knowl. Discov. Data 10, 1, Article 5 (July 2015). https://doi.org/10.1145/2733381

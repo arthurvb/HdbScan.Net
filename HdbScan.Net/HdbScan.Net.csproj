@@ -9,9 +9,9 @@
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <Title>HdbScan.Net</Title>
-    <Version>1.0.1</Version>
+    <Version>1.0.14</Version>
     <Authors>arthurvb</Authors>
-    <Description>HDBSCAN (Hierarchical Density-Based Spatial Clustering of Applications with Noise) for .NET</Description>
+    <Description>HDBSCAN (Hierarchical Density-Based Spatial Clustering of Applications with Noise) for .NET. Developed with AI assistance (human-reviewed, validated against scikit-learn).</Description>
     <PackageProjectUrl>https://github.com/arthurvb/HdbScan.Net</PackageProjectUrl>
     <RepositoryUrl>https://github.com/arthurvb/HdbScan.Net</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
