@@ -612,8 +612,16 @@ namespace HdbScan.Net.Test
 
             Assert.Throws<ArgumentOutOfRangeException>(() =>
             {
-                var options = new HdbScanOptions { MinSamples = 1 };
+                var options = new HdbScanOptions { MaxDegreeOfParallelism = 0 };
             });
+
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+            {
+                var options = new HdbScanOptions { MaxDegreeOfParallelism = -2 };
+            });
+
+            // 1 is valid (as in scikit-learn): every point is a core point.
+            Assert.That(new HdbScanOptions { MinSamples = 1 }.MinSamples, Is.EqualTo(1));
         }
 
         [Test]
@@ -734,13 +742,15 @@ namespace HdbScan.Net.Test
             var options = new HdbScanOptions { MinClusterSize = 5 };
             var model = new HdbScan<double[]>(points.ToArray(), EuclideanDistance, options);
 
-            // Core points in BOTH clusters should have low scores (< 0.5).
+            // Core points in BOTH clusters should have low scores (<= 0.5).
             // This is the key regression test — the old bug inflated sparse cluster scores.
+            // The bound is inclusive: a grid corner leaves at twice the grid spacing, half
+            // the peak density of its cluster, which is a score of exactly 0.5.
             for (var i = 0; i < 20; i++)
             {
                 if (model.Labels[i] >= 0)
                 {
-                    Assert.That(model.OutlierScores[i], Is.LessThan(0.5),
+                    Assert.That(model.OutlierScores[i], Is.LessThanOrEqualTo(0.5),
                         $"Dense cluster point {i} should have low outlier score");
                 }
             }
@@ -749,7 +759,7 @@ namespace HdbScan.Net.Test
             {
                 if (model.Labels[i] >= 0)
                 {
-                    Assert.That(model.OutlierScores[i], Is.LessThan(0.5),
+                    Assert.That(model.OutlierScores[i], Is.LessThanOrEqualTo(0.5),
                         $"Sparse cluster point {i} should have low outlier score");
                 }
             }
@@ -900,6 +910,293 @@ namespace HdbScan.Net.Test
             var setosaMedianScore = model.OutlierScores.Take(50).OrderBy(x => x).ElementAt(25);
             Assert.That(setosaMedianScore, Is.LessThan(0.5),
                 "Setosa (well-separated cluster) should have low median outlier score");
+        }
+
+        /// <summary>
+        /// Every single label must equal scikit-learn's, including the cluster numbering.
+        /// Python reference (scikit-learn 1.8, algorithm='brute' and 'kd_tree' agree):
+        ///   X = pd.read_csv("iris_kpca_poly_d2c1.csv")[["x", "y"]].values
+        ///   HDBSCAN(min_cluster_size=3, min_samples=3).fit(X).labels_
+        /// </summary>
+        [Test]
+        public void IrisKpca_ExactLabels_MatchScikitLearn()
+        {
+            var xs = ReadXY("iris_kpca_poly_d2c1.csv").ToArray();
+
+            var options = new HdbScanOptions { MinClusterSize = 3, MinSamples = 3 };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options);
+
+            int[] expected =
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                -1, 9, -1, 3, 9, 10, 9, 1, 9, 3, 1, -1, 5, 11, -1, 9, 10, 5, -1, 3, 11, 5, 11, 11, 11,
+                9, -1, -1, 11, -1, 3, 3, 5, 11, 10, 11, -1, 11, 5, 3, 5, 11, 5, 1, 5, 5, 5, -1, 1, 5,
+                -1, 11, -1, 4, 4, 2, -1, -1, 4, -1, 6, -1, 7, 8, 11, 6, 6, -1, -1, 8, 7, 8, 2, 11, 7,
+                -1, 11, 11, 4, -1, -1, -1, 4, 11, -1, 2, 7, 6, 11, 7, 7, -1, 11, 7, 7, 6, 11, 6, 6, 11,
+            ];
+            Assert.That(model.Labels, Is.EqualTo(expected));
+        }
+
+        /// <summary>
+        /// When the root is selected as the single cluster, scikit-learn keeps only the points
+        /// that stay until the root's highest density; points that leave earlier are noise.
+        /// Python reference (scikit-learn 1.8, algorithm='brute' and 'kd_tree' agree):
+        ///   X = iris[:50]   # setosa only
+        ///   hdb = HDBSCAN(min_cluster_size=10, min_samples=2, allow_single_cluster=True).fit(X)
+        ///   np.where(hdb.labels_ == -1)[0]; hdb.probabilities_   # 1 for members, 0 for noise
+        /// </summary>
+        [Test]
+        public void SingleCluster_NoisePoints_MatchScikitLearn()
+        {
+            var xs = ReadIris("iris.csv").Take(50).ToArray();
+
+            var options = new HdbScanOptions { MinClusterSize = 10, MinSamples = 2, AllowSingleCluster = true };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options, predictionData: true);
+
+            int[] expectedNoise = [5, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 31, 32, 33, 36, 41, 44, 46];
+
+            Assert.That(model.ClusterCount, Is.EqualTo(1));
+            for (var i = 0; i < xs.Length; i++)
+            {
+                var noise = expectedNoise.Contains(i);
+                Assert.That(model.Labels[i], Is.EqualTo(noise ? -1 : 0), $"Label of point {i}");
+                Assert.That(model.Probabilities[i], Is.EqualTo(noise ? 0.0 : 1.0), $"Probability of point {i}");
+
+                // Prediction applies the same rule.
+                Assert.That(model.Predict(xs[i]), Is.EqualTo(model.Labels[i]), $"Prediction of point {i}");
+            }
+        }
+
+        /// <summary>
+        /// MinSamples = 1: every point is a core point (plain single linkage distances).
+        /// Python reference (scikit-learn 1.8):
+        ///   HDBSCAN(min_cluster_size=5, min_samples=1).fit(X)   # X = iris_kpca_poly_d2c1
+        ///   9 clusters, 21 noise points
+        /// </summary>
+        [Test]
+        public void IrisKpca_MinSamplesOne_MatchesScikitLearn()
+        {
+            var xs = ReadXY("iris_kpca_poly_d2c1.csv").ToArray();
+
+            var options = new HdbScanOptions { MinClusterSize = 5, MinSamples = 1 };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options);
+
+            Assert.That(model.ClusterCount, Is.EqualTo(9));
+            Assert.That(model.Labels.Count(l => l == -1), Is.EqualTo(21));
+
+            var clusterSizes = model.Labels.Where(l => l >= 0).GroupBy(l => l).Select(g => g.Count()).OrderByDescending(c => c).ToArray();
+            Assert.That(clusterSizes, Is.EqualTo(new[] { 50, 25, 12, 10, 8, 7, 6, 6, 5 }));
+        }
+
+        /// <summary>
+        /// HDBSCAN only compares distances, so the unit of measurement must not matter.
+        /// The scales are powers of two: those rescale floating point numbers exactly, so
+        /// equal distances stay equal and the results must be identical.
+        /// </summary>
+        [TestCase(1.0 / (1 << 30))]
+        [TestCase(1 << 20)]
+        public void ScaleInvariance(double scale)
+        {
+            var xs = ReadIris("iris.csv").ToArray();
+            var scaled = xs.Select(x => x.Select(v => v * scale).ToArray()).ToArray();
+
+            var options = new HdbScanOptions { MinClusterSize = 5 };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options);
+            var scaledModel = new HdbScan<double[]>(scaled, EuclideanDistance, options);
+
+            Assert.That(scaledModel.Labels, Is.EqualTo(model.Labels));
+            Assert.That(scaledModel.Probabilities, Is.EqualTo(model.Probabilities).Within(1e-12));
+            Assert.That(scaledModel.OutlierScores, Is.EqualTo(model.OutlierScores).Within(1e-12));
+        }
+
+        /// <summary>
+        /// Duplicate points have distance 0, i.e. infinite density (lambda). Results must
+        /// stay well-defined: no NaN, everything in [0, 1].
+        /// </summary>
+        [Test]
+        public void DuplicatePoints_ResultsAreWellDefined()
+        {
+            var xs = new List<double[]>();
+            for (var i = 0; i < 6; i++) xs.Add([0, 0]);          // 6 duplicates
+            for (var i = 0; i < 6; i++) xs.Add([0.1 * i, 0.3]);  // spread out, same region
+            for (var i = 0; i < 6; i++) xs.Add([50, 50]);        // 6 duplicates, far away
+            for (var i = 0; i < 6; i++) xs.Add([50 + 0.1 * i, 50.3]);
+
+            foreach (var method in new[] { ClusterSelectionMethod.ExcessOfMass, ClusterSelectionMethod.Leaf })
+            {
+                var options = new HdbScanOptions { MinClusterSize = 3, ClusterSelectionMethod = method };
+                var model = new HdbScan<double[]>(xs, EuclideanDistance, options, predictionData: true);
+
+                Assert.That(model.ClusterCount, Is.GreaterThanOrEqualTo(2));
+                Assert.That(model.Probabilities, Is.All.InRange(0.0, 1.0));
+                Assert.That(model.OutlierScores, Is.All.InRange(0.0, 1.0));
+
+                // The duplicates are the densest points there are: full members, no outliers.
+                foreach (var i in new[] { 0, 5, 12, 17 })
+                {
+                    Assert.That(model.Labels[i], Is.GreaterThanOrEqualTo(0));
+                    Assert.That(model.Probabilities[i], Is.EqualTo(1.0));
+                    Assert.That(model.OutlierScores[i], Is.EqualTo(0.0));
+                }
+                Assert.That(model.Labels[0], Is.Not.EqualTo(model.Labels[12]));
+
+                Assert.That(model.PredictWithProbability([0, 0]), Is.EqualTo((model.Labels[0], 1.0)));
+            }
+        }
+
+        [Test]
+        public void InvalidDistancesThrow()
+        {
+            double[][] xs = [[0, 0], [0, 1], [1, 0], [1, 1], [0.5, 0.5], [10, 10]];
+            var options = new HdbScanOptions { MinClusterSize = 3, AllowSingleCluster = true };
+
+            foreach (var bad in new[] { double.NaN, double.PositiveInfinity, double.NegativeInfinity, -1.0 })
+            {
+                // A metric that returns the bad value for the far-away point only.
+                Func<double[], double[], double> metric = (a, b) => a[0] > 5 || b[0] > 5 ? bad : EuclideanDistance(a, b);
+
+                Assert.Throws<ArgumentException>(() => new HdbScan<double[]>(xs, metric, options), $"Fitting with distance {bad}");
+
+                var model = new HdbScan<double[]>(xs.Take(5).ToArray(), metric, options, predictionData: true);
+                Assert.That(model.ClusterCount, Is.EqualTo(1));
+                Assert.Throws<ArgumentException>(() => model.Predict([10, 10]), $"Predicting with distance {bad}");
+            }
+        }
+
+        /// <summary>
+        /// Without the stored distance matrix (the mode used automatically above 46,340 points)
+        /// and with parallel distance computation, the result must be exactly the same.
+        /// </summary>
+        [TestCase(true, 4)]
+        [TestCase(true, -1)]
+        [TestCase(false, 1)]
+        [TestCase(false, 4)]
+        [TestCase(false, -1)]
+        public void DistanceMatrixAndParallelism_DoNotChangeResults(bool storeDistanceMatrix, int maxDegreeOfParallelism)
+        {
+            foreach (var xs in new[] { ReadXY("iris_kpca_poly_d2c1.csv").ToArray(), ReadIris("iris.csv").ToArray(), ReadCsv("pendigits.csv", columns: 64).ToArray() })
+            {
+                var expected = new HdbScan<double[]>(xs, EuclideanDistance, new HdbScanOptions { MinClusterSize = 3 }, predictionData: true);
+
+                var options = new HdbScanOptions
+                {
+                    MinClusterSize = 3,
+                    StoreDistanceMatrix = storeDistanceMatrix,
+                    MaxDegreeOfParallelism = maxDegreeOfParallelism
+                };
+                var model = new HdbScan<double[]>(xs, EuclideanDistance, options, predictionData: true);
+
+                Assert.That(model.ClusterCount, Is.EqualTo(expected.ClusterCount));
+                Assert.That(model.Labels, Is.EqualTo(expected.Labels));
+                Assert.That(model.Probabilities, Is.EqualTo(expected.Probabilities));
+                Assert.That(model.OutlierScores, Is.EqualTo(expected.OutlierScores));
+                Assert.That(model.PredictWithProbability(xs[0]), Is.EqualTo(expected.PredictWithProbability(xs[0])));
+            }
+        }
+
+        /// <summary>
+        /// Without the distance matrix the metric is called 3 times as often (n² for the core
+        /// distances + n²/2 for the MST, instead of n²/2), and nothing of size n² is needed.
+        /// </summary>
+        [Test]
+        public void WithoutDistanceMatrix_MetricCallCount()
+        {
+            var xs = ReadIris("iris.csv").ToArray();
+            var n = xs.Length;
+
+            long Calls(bool storeDistanceMatrix)
+            {
+                var calls = 0L;
+                var options = new HdbScanOptions { StoreDistanceMatrix = storeDistanceMatrix };
+                _ = new HdbScan<double[]>(xs, (a, b) => { calls++; return EuclideanDistance(a, b); }, options);
+                return calls;
+            }
+
+            Assert.That(Calls(true), Is.EqualTo(n * (n - 1) / 2));
+            Assert.That(Calls(false), Is.EqualTo(n * (n - 1) + n * (n - 1) / 2));
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void InvalidDistanceInParallelThrowsArgumentException(bool storeDistanceMatrix)
+        {
+            var xs = ReadIris("iris.csv").ToArray();
+            var options = new HdbScanOptions { StoreDistanceMatrix = storeDistanceMatrix, MaxDegreeOfParallelism = 4 };
+
+            Assert.Throws<ArgumentException>(() => new HdbScan<double[]>(xs, (a, b) => double.NaN, options));
+        }
+
+        [Test]
+        public void TooFewPoints_KeepsPredictionData()
+        {
+            double[][] xs = [[0, 0], [1, 1]];
+
+            var options = new HdbScanOptions { MinClusterSize = 5 };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options, predictionData: true);
+
+            Assert.That(model.HasPredictionData, Is.True);
+            Assert.That(model.PredictWithProbability([0, 0]), Is.EqualTo((-1, 0.0)));
+        }
+
+        /// <summary>
+        /// A new point far away from all training data is noise, whatever the number of clusters.
+        /// </summary>
+        [TestCase(false)]
+        [TestCase(true)]
+        public void Predict_FarAwayPointIsNoise(bool singleCluster)
+        {
+            var xs = singleCluster ? ReadIris("iris.csv").Take(50).ToArray() : ReadIris("iris.csv").ToArray();
+
+            var options = new HdbScanOptions { MinClusterSize = 5, AllowSingleCluster = singleCluster };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options, predictionData: true);
+            Assert.That(model.ClusterCount, Is.EqualTo(singleCluster ? 1 : 2));
+
+            Assert.That(model.PredictWithProbability([1e6, 1e6, 1e6, 1e6]), Is.EqualTo((-1, 0.0)));
+            Assert.That(model.PredictWithProbability([8, 8, 8, 8]), Is.EqualTo((-1, 0.0)));
+        }
+
+        /// <summary>
+        /// Predicting a training point must give back exactly its fitted label and probability,
+        /// noise points included.
+        /// </summary>
+        [TestCase(ClusterSelectionMethod.ExcessOfMass)]
+        [TestCase(ClusterSelectionMethod.Leaf)]
+        public void Predict_TrainingPointsReproduceFit(ClusterSelectionMethod method)
+        {
+            var xs = ReadXY("iris_kpca_poly_d2c1.csv").ToArray();
+
+            var options = new HdbScanOptions { MinClusterSize = 3, ClusterSelectionMethod = method };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options, predictionData: true);
+            Assert.That(model.Labels, Has.Some.EqualTo(-1), "The data set should contain noise");
+
+            for (var i = 0; i < xs.Length; i++)
+            {
+                Assert.That(model.PredictWithProbability(xs[i]), Is.EqualTo((model.Labels[i], model.Probabilities[i])), $"Point {i}");
+            }
+        }
+
+        /// <summary>
+        /// A point between a cluster's members is predicted into that cluster.
+        /// </summary>
+        [Test]
+        public void Predict_PointInsideCluster()
+        {
+            var xs = ReadIris("iris.csv").ToArray();
+
+            var options = new HdbScanOptions { MinClusterSize = 5 };
+            var model = new HdbScan<double[]>(xs, EuclideanDistance, options, predictionData: true);
+
+            // Midpoints of training points 0-1 (setosa) and 100-101 (virginica).
+            var (setosaLabel, setosaProb) = model.PredictWithProbability(Midpoint(xs[0], xs[1]));
+            Assert.That(setosaLabel, Is.EqualTo(model.Labels[0]));
+            Assert.That(setosaProb, Is.InRange(0.0, 1.0).And.GreaterThan(0.0));
+
+            var (otherLabel, otherProb) = model.PredictWithProbability(Midpoint(xs[100], xs[101]));
+            Assert.That(otherLabel, Is.EqualTo(model.Labels[100]));
+            Assert.That(otherProb, Is.InRange(0.0, 1.0).And.GreaterThan(0.0));
+
+            static double[] Midpoint(double[] a, double[] b) => a.Zip(b, (x, y) => (x + y) / 2).ToArray();
         }
     }
 }

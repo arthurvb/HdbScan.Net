@@ -1,53 +1,68 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
 
 namespace HdbScan.Net
 {
     /// <summary>
-    /// T-independent HDBSCAN pipeline steps. All methods operate on distance matrices,
+    /// T-independent HDBSCAN pipeline steps. All methods operate on pairwise distances,
     /// integer indices, and double distances — no knowledge of the point type T.
     /// </summary>
     internal static class HdbScanAlgorithm
     {
         /// <summary>
-        /// Small epsilon added to distances before inverting to lambda (= 1/(distance + ε))
-        /// to avoid division by zero when distance is exactly 0.
+        /// Section 5.1: density level λ = 1/ε for a distance ε. Distance 0 (duplicate points)
+        /// is the highest possible density, λ = ∞ — the same convention as sklearn.
         /// </summary>
-        internal const double CondenseEpsilon = 1e-10;
+        internal static double Lambda(double distance)
+        {
+            return distance > 0 ? 1.0 / distance : double.PositiveInfinity;
+        }
+
         /// <summary>
         /// Definition 3.1: dcore(xp) = distance from xp to its mpts-nearest neighbor (incl. xp).
         /// Uses a bounded max-heap (PriorityQueue with reversed comparison, size k) to find
         /// the k-th smallest distance in O(n log k) per point instead of O(n log n) via full sort.
         /// Matches sklearn: tree.query(X, k=min_samples)[0][:, -1].
         /// </summary>
-        internal static double[] ComputeCoreDistances(double[] distMatrix, int n, int k)
+        internal static double[] ComputeCoreDistances(Distances distances, int k, int parallelism = 1)
         {
+            var n = distances.Count;
             var coreDistances = new double[n];
             k = Math.Min(k, n);
 
             // Max-heap of size k: root is always the largest among the k smallest distances seen so far.
-            var heap = new PriorityQueue<byte, double>(k, Comparer<double>.Create((a, b) => b.CompareTo(a)));
-
-            for (var i = 0; i < n; i++)
+            // The points are independent of each other, so they can be handled in parallel;
+            // every thread then works with a heap and a row buffer of its own.
+            var maxFirst = Comparer<double>.Create((a, b) => b.CompareTo(a));
+            For(n, parallelism, () => (Heap: new PriorityQueue<byte, double>(k, maxFirst), Buffer: new double[n]), (i, own) =>
             {
+                var heap = own.Heap;
                 heap.Clear();
-                var rowOffset = i * n;
+                var kthSmallest = 0.0;
+                var row = distances.Row(i, own.Buffer);
                 for (var j = 0; j < n; j++)
                 {
-                    var d = i == j ? 0.0 : distMatrix[rowOffset + j];
+                    var d = i == j ? 0.0 : row[j];
                     if (heap.Count < k)
                     {
                         heap.Enqueue(0, d);
                     }
-                    else
+                    else if (d < kthSmallest)
                     {
                         heap.EnqueueDequeue(0, d);
                     }
+                    else
+                    {
+                        // Not among the k smallest: the common case, kept out of the heap for speed.
+                        continue;
+                    }
+                    heap.TryPeek(out _, out kthSmallest);
                 }
-                heap.TryPeek(out _, out var kthSmallest);
                 coreDistances[i] = kthSmallest;
-            }
+            });
 
             return coreDistances;
         }
@@ -57,10 +72,8 @@ namespace HdbScan.Net
         /// Effectively "pushes apart" points in sparse regions while preserving distances
         /// in dense regions.
         /// </summary>
-        internal static double MutualReachabilityDistance(double[] distMatrix, int n,
-            double[] coreDistances, int i, int j)
+        internal static double MutualReachabilityDistance(double[] coreDistances, int i, int j, double dist)
         {
-            var dist = distMatrix[i * n + j];
             return Math.Max(Math.Max(coreDistances[i], coreDistances[j]), dist);
         }
 
@@ -68,56 +81,59 @@ namespace HdbScan.Net
         /// Algorithm 1 Step 2 / Proposition 3.4: the MST of the mutual reachability
         /// graph Gmpts encodes the density-based clustering hierarchy. Single-linkage on
         /// mutual reachability distances produces all DBSCAN* partitions hierarchically.
-        /// Built via Prim's algorithm in O(n^2).
+        /// Built via Prim's algorithm in O(n^2). Each step needs one row of distances: from the
+        /// point just added to the points that are not in the tree yet.
+        /// All distances must be finite (checked where they are computed), so every
+        /// step finds a next point and the result is always a spanning tree of n - 1 edges.
         /// </summary>
-        internal static MstEdge[] BuildMst(double[] distMatrix, int n, double[] coreDistances)
+        internal static MstEdge[] BuildMst(Distances distances, double[] coreDistances, int parallelism = 1)
         {
+            var n = distances.Count;
+            var buffer = new double[n];
             var inMst = new bool[n];
             var minDist = new double[n];
             var minEdge = new int[n];
             var edges = new MstEdge[n - 1];
 
-            Array.Fill(minDist, double.MaxValue);
+            // minDist[j] = distance from point j to the nearest point in the tree, minEdge[j] = that point.
+            Array.Fill(minDist, double.PositiveInfinity);
             Array.Fill(minEdge, -1);
 
+            // The tree starts as point 0 and grows by one point per step.
+            var current = 0;
             inMst[0] = true;
-            for (var j = 1; j < n; j++)
-            {
-                var d = MutualReachabilityDistance(distMatrix, n, coreDistances, 0, j);
-                minDist[j] = d;
-                minEdge[j] = 0;
-            }
 
             for (var step = 0; step < n - 1; step++)
             {
-                var minVal = double.MaxValue;
+                // One pass over the points outside the tree: the point just added may be nearer
+                // to them than the rest of the tree is; then pick the one nearest to the tree.
+                var row = distances.Row(current, buffer, inMst, parallelism);
+                var minVal = double.PositiveInfinity;
                 var minIdx = -1;
-                for (var i = 0; i < n; i++)
+                for (var j = 0; j < n; j++)
                 {
-                    if (!inMst[i] && minDist[i] < minVal)
+                    if (inMst[j])
                     {
-                        minVal = minDist[i];
-                        minIdx = i;
+                        continue;
+                    }
+
+                    var d = MutualReachabilityDistance(coreDistances, current, j, row[j]);
+                    if (d < minDist[j])
+                    {
+                        minDist[j] = d;
+                        minEdge[j] = current;
+                    }
+
+                    if (minDist[j] < minVal)
+                    {
+                        minVal = minDist[j];
+                        minIdx = j;
                     }
                 }
-
-                if (minIdx == -1) break;
 
                 inMst[minIdx] = true;
                 edges[step] = new MstEdge(minEdge[minIdx], minIdx, minVal);
-
-                for (var j = 0; j < n; j++)
-                {
-                    if (!inMst[j])
-                    {
-                        var d = MutualReachabilityDistance(distMatrix, n, coreDistances, minIdx, j);
-                        if (d < minDist[j])
-                        {
-                            minDist[j] = d;
-                            minEdge[j] = minIdx;
-                        }
-                    }
-                }
+                current = minIdx;
             }
 
             return edges;
@@ -175,12 +191,12 @@ namespace HdbScan.Net
             var condensed = new List<CondensedTreeEdge>();
 
             // Map each dendrogram node to (left, right, lambda, size).
-            // Lambda = 1/(distance + ε) converts distance to density level (Section 5.1: λ = 1/ε).
+            // Lambda = 1/distance converts distance to density level (Section 5.1: λ = 1/ε).
             var nodeInfo = new Dictionary<int, (int Left, int Right, double Lambda, int Size)>();
             var nodeLabel = n;
             foreach (var node in singleLinkageTree)
             {
-                nodeInfo[nodeLabel] = (node.Left, node.Right, 1.0 / (node.Distance + CondenseEpsilon), node.Size);
+                nodeInfo[nodeLabel] = (node.Left, node.Right, Lambda(node.Distance), node.Size);
                 nodeLabel++;
             }
 
@@ -216,23 +232,16 @@ namespace HdbScan.Net
 
             // Parent tracks the current cluster identity: (child, child) = new cluster,
             // (child, parent) = continuation of the parent cluster (no genuine split).
-            var stack = new Stack<(int Node, int Parent)>();
-            stack.Push((root, root));
-            while (stack.Count > 0)
+            // The walk is breadth-first, like sklearn's, so clusters get the same ids —
+            // and in the end the same labels — as in sklearn.
+            var queue = new Queue<(int Node, int Parent)>();
+            queue.Enqueue((root, root));
+            while (queue.Count > 0)
             {
-                var (node, parent) = stack.Pop();
+                var (node, parent) = queue.Dequeue();
 
-                // Leaf point (index < n): this point reached the stack without being
-                // part of a large-enough cluster split — record it departing at
-                // the parent cluster's lambda.
-                if (node < n)
-                {
-                    var lambda = nodeInfo.ContainsKey(parent) ? nodeInfo[parent].Lambda : 0;
-                    condensed.Add(new CondensedTreeEdge(relabel[parent], node, lambda, 1));
-                    continue;
-                }
-
-                // Internal node (index >= n): inspect its children to decide
+                // Only internal nodes (index >= n) are ever queued: a node is queued when it
+                // has at least minClusterSize >= 2 points. Inspect its children to decide
                 // whether this is a genuine split or a continuation.
                 var (left, right, lambdaVal, size) = nodeInfo[node];
                 // A leaf child (< n) has size 1; an internal child's size is stored in nodeInfo.
@@ -246,22 +255,22 @@ namespace HdbScan.Net
                     relabel[right] = nextCondensedLabel++;
                     condensed.Add(new CondensedTreeEdge(relabel[parent], relabel[left], lambdaVal, leftSize));
                     condensed.Add(new CondensedTreeEdge(relabel[parent], relabel[right], lambdaVal, rightSize));
-                    stack.Push((right, right));
-                    stack.Push((left, left));
+                    queue.Enqueue((left, left));
+                    queue.Enqueue((right, right));
                 }
                 else if (leftSize >= minClusterSize)
                 {
                     // Left survives; right's points fall out of the current cluster.
                     relabel[left] = relabel[parent];
                     FallOutPoints(right, lambdaVal, relabel[parent]);
-                    stack.Push((left, parent));
+                    queue.Enqueue((left, parent));
                 }
                 else if (rightSize >= minClusterSize)
                 {
                     // Right survives; left's points fall out of the current cluster.
                     relabel[right] = relabel[parent];
                     FallOutPoints(left, lambdaVal, relabel[parent]);
-                    stack.Push((right, parent));
+                    queue.Enqueue((right, parent));
                 }
                 else
                 {
@@ -297,32 +306,35 @@ namespace HdbScan.Net
             return (edgesBySource, edgeByTarget);
         }
 
-        internal static (int[] Labels, double[] Probabilities, int ClusterCount) ExtractClusters(
+        /// <summary>
+        /// Section 5.2: extracts the flat clustering from the condensed tree. Selects the
+        /// clusters (EOM or Leaf), numbers them 0, 1, 2, ... in order of their condensed tree id
+        /// (as sklearn does), and labels every point with <see cref="ClusterSelection.Assign"/>.
+        /// </summary>
+        internal static (int[] Labels, double[] Probabilities, ClusterSelection Selection) ExtractClusters(
             List<CondensedTreeEdge> condensedTree, int n, ClusterSelectionMethod method, bool allowSingleCluster)
         {
             var labels = new int[n];
             var probabilities = new double[n];
             Array.Fill(labels, -1);
 
-            if (condensedTree.Count == 0)
-            {
-                return (labels, probabilities, 0);
-            }
-
             var (edgesBySource, edgeByTarget) = BuildCondensedTreeIndex(condensedTree);
 
             // All internal nodes that appear as parents = the set of clusters in the condensed tree.
             var clusters = edgesBySource.Keys.ToHashSet();
 
+            HashSet<int> selectedClusters;
             if (clusters.Count == 1 && !allowSingleCluster)
             {
-                return (labels, probabilities, 0);
+                // The root is the only cluster and may not be selected: everything is noise.
+                selectedClusters = new HashSet<int>();
             }
-
-            HashSet<int> selectedClusters;
-            if (method == ClusterSelectionMethod.Leaf)
+            else if (method == ClusterSelectionMethod.Leaf)
             {
                 // Leaf method: select clusters that have no child clusters (only point edges).
+                // If the root has no child clusters it is the single cluster. (sklearn selects
+                // the root in that case too, but then overwrites the selection and returns
+                // only noise.)
                 var clustersWithChildren = new HashSet<int>();
                 foreach (var (source, edges) in edgesBySource)
                 {
@@ -342,11 +354,6 @@ namespace HdbScan.Net
                 selectedClusters = SelectClustersEom(edgesBySource, edgeByTarget, clusters, n, allowSingleCluster);
             }
 
-            if (selectedClusters.Count == 0)
-            {
-                return (labels, probabilities, 0);
-            }
-
             // Max lambda across all edges (point + child cluster splits) for each selected
             // cluster, used to normalize membership probabilities. This matches sklearn's
             // max_lambdas() in _tree.pyx which considers all edges, not just point edges.
@@ -354,45 +361,140 @@ namespace HdbScan.Net
             foreach (var cluster in selectedClusters)
             {
                 var maxLambda = 0.0;
-                if (edgesBySource.TryGetValue(cluster, out var edges))
+                foreach (var edge in edgesBySource[cluster])
                 {
-                    foreach (var edge in edges)
+                    if (edge.Lambda > maxLambda)
                     {
-                        if (edge.Lambda > maxLambda)
-                        {
-                            maxLambda = edge.Lambda;
-                        }
+                        maxLambda = edge.Lambda;
                     }
                 }
                 clusterMaxLambda[cluster] = maxLambda;
             }
 
-            // Map internal cluster IDs to 0-based output labels.
-            var clusterToLabel = selectedClusters.Select((c, i) => (c, i)).ToDictionary(x => x.c, x => x.i);
+            // Map internal cluster IDs to 0-based output labels, in order of cluster ID.
+            var clusterToLabel = selectedClusters.OrderBy(c => c).Select((c, i) => (c, i)).ToDictionary(x => x.c, x => x.i);
 
-            // Assign each point to the nearest selected ancestor in the condensed tree.
-            // Probability = lambda_point / max_lambda_cluster, clamped to [0, 1].
+            var selection = new ClusterSelection(edgeByTarget, clusterToLabel, clusterMaxLambda, n);
+
+            // Each point edge says "this point left SourceCluster at density Lambda".
             foreach (var edge in condensedTree.Where(e => e.Target < n))
             {
-                var point = edge.Target;
-                var cluster = edge.SourceCluster;
+                (labels[edge.Target], probabilities[edge.Target]) = selection.Assign(edge.SourceCluster, edge.Lambda);
+            }
 
-                // Walk up to the selected cluster (may be the source itself or an ancestor).
-                while (!selectedClusters.Contains(cluster))
+            return (labels, probabilities, selection);
+        }
+
+        /// <summary>
+        /// The selected clusters, plus the rule that turns "a point left cluster C at density λ"
+        /// into a label and a membership probability. The same rule labels the training points
+        /// (<see cref="ExtractClusters"/>) and new points (<see cref="Predict"/>).
+        /// </summary>
+        /// <param name="edgeByTarget">For every point and every non-root cluster: the condensed tree edge from its parent cluster.</param>
+        /// <param name="clusterToLabel">Output label of every selected cluster.</param>
+        /// <param name="clusterMaxLambda">Highest density at which each selected cluster still exists.</param>
+        /// <param name="root">Id of the root cluster (= n, the number of points).</param>
+        internal sealed class ClusterSelection(
+            Dictionary<int, CondensedTreeEdge> edgeByTarget,
+            Dictionary<int, int> clusterToLabel,
+            Dictionary<int, double> clusterMaxLambda,
+            int root)
+        {
+            public int ClusterCount => clusterToLabel.Count;
+
+            /// <summary>
+            /// Label and membership probability of a point that left <paramref name="cluster"/>
+            /// at density <paramref name="lambda"/>. Matches sklearn's _do_labelling and
+            /// get_probabilities in _tree.pyx.
+            /// </summary>
+            public (int Label, double Probability) Assign(int cluster, double lambda)
+            {
+                // The point belongs to the nearest selected cluster on the way up to the root
+                // (the cluster itself or an ancestor). If there is none, it is noise.
+                while (!clusterToLabel.ContainsKey(cluster))
                 {
-                    if (!edgeByTarget.TryGetValue(cluster, out var parentEdge)) break;
+                    if (!edgeByTarget.TryGetValue(cluster, out var parentEdge))
+                    {
+                        return (-1, 0.0);
+                    }
                     cluster = parentEdge.SourceCluster;
                 }
 
-                if (selectedClusters.Contains(cluster))
+                var maxLambda = clusterMaxLambda[cluster];
+
+                // The root contains every point, so when it is the selected cluster (only
+                // possible with allowSingleCluster, and then it is the only one) membership
+                // needs a cut-off: sklearn keeps the points that stay until the root's highest
+                // density and treats the points that left earlier as noise.
+                if (cluster == root && lambda < maxLambda)
                 {
-                    labels[point] = clusterToLabel[cluster];
-                    var maxLambda = clusterMaxLambda[cluster];
-                    probabilities[point] = maxLambda > 0 ? Math.Min(1.0, edge.Lambda / maxLambda) : 1.0;
+                    return (-1, 0.0);
                 }
+
+                // Probability = lambda_point / max_lambda_cluster. A point that left a
+                // sub-cluster has lambda > max_lambda and gets 1, as does a duplicate (λ = ∞).
+                var probability = double.IsPositiveInfinity(lambda) ? 1.0 : Math.Min(lambda, maxLambda) / maxLambda;
+                return (clusterToLabel[cluster], probability);
             }
 
-            return (labels, probabilities, selectedClusters.Count);
+            /// <summary>
+            /// Predicts the cluster of a new point x from its distances to the training points,
+            /// without changing the clustering: finds where x would attach to the condensed tree
+            /// and labels it like a training point in that position. Follows approximate_predict
+            /// of the scikit-learn-contrib/hdbscan library (sklearn itself has no prediction).
+            /// </summary>
+            /// <param name="distances">Distance from x to each training point.</param>
+            /// <param name="coreDistances">Core distance of each training point.</param>
+            /// <param name="k">The k (min samples) used for the core distances.</param>
+            public (int Label, double Probability) Predict(double[] distances, double[] coreDistances, int k)
+            {
+                var n = distances.Length;
+                k = Math.Min(k, n);
+
+                // Definition 3.1, measured against the training data: the core distance of x is
+                // the radius around x that holds k training points. For a training point this is
+                // exactly its own core distance (it counts itself, at distance 0).
+                var sorted = (double[])distances.Clone();
+                Array.Sort(sorted);
+                var coreDistance = sorted[k - 1];
+
+                // The training point nearest to x in mutual reachability distance (Definition 3.2)
+                // is where x attaches to the hierarchy, at density lambda. Ties go to the point
+                // that is nearest in plain distance.
+                var neighbor = -1;
+                var neighborDistance = double.PositiveInfinity;
+                for (var i = 0; i < n; i++)
+                {
+                    var d = Math.Max(Math.Max(coreDistance, coreDistances[i]), distances[i]);
+                    if (d < neighborDistance || d == neighborDistance && distances[i] < distances[neighbor])
+                    {
+                        neighborDistance = d;
+                        neighbor = i;
+                    }
+                }
+                var lambda = Lambda(neighborDistance);
+
+                var neighborEdge = edgeByTarget[neighbor];
+                var cluster = neighborEdge.SourceCluster;
+                if (neighborEdge.Lambda <= lambda)
+                {
+                    // x holds on to its neighbor at least as long as the neighbor holds on to
+                    // its cluster, so x leaves that cluster together with the neighbor.
+                    lambda = neighborEdge.Lambda;
+                }
+                else
+                {
+                    // x lets go of its neighbor earlier, at density lambda. It can only be a
+                    // member of clusters that already existed then: climb past every cluster
+                    // that was born (split off from its parent) at density lambda or higher.
+                    while (edgeByTarget.TryGetValue(cluster, out var birthEdge) && birthEdge.Lambda >= lambda)
+                    {
+                        cluster = birthEdge.SourceCluster;
+                    }
+                }
+
+                return Assign(cluster, lambda);
+            }
         }
 
         /// <summary>
@@ -428,7 +530,12 @@ namespace HdbScan.Net
                         // Equation (3): S(Ci) = Σ (λ_max(xj,Ci) - λ_min(Ci)).
                         // edge.Size groups points that share the same departure lambda,
                         // so × size is equivalent to summing over individual points.
-                        stab += (edge.Lambda - birthLambda) * edge.Size;
+                        // Edges at the birth lambda itself add nothing; skipping them also
+                        // avoids ∞ - ∞ for a cluster born at distance 0 (duplicate points).
+                        if (edge.Lambda > birthLambda)
+                        {
+                            stab += (edge.Lambda - birthLambda) * edge.Size;
+                        }
                     }
                 }
 
@@ -464,14 +571,19 @@ namespace HdbScan.Net
                 processed.Add(leaf);
             }
 
+            // Deselects a cluster and everything below it. Iterative: the condensed tree
+            // can be deep enough to overflow the call stack with recursion.
             void RemoveDescendants(int cluster)
             {
-                selected.Remove(cluster);
-                if (childClusters.ContainsKey(cluster))
+                var pending = new Stack<int>();
+                pending.Push(cluster);
+                while (pending.Count > 0)
                 {
-                    foreach (var child in childClusters[cluster])
+                    var current = pending.Pop();
+                    selected.Remove(current);
+                    foreach (var child in childClusters[current])
                     {
-                        RemoveDescendants(child);
+                        pending.Push(child);
                     }
                 }
             }
@@ -613,12 +725,12 @@ namespace HdbScan.Net
             {
                 if (pointEdge.TryGetValue(i, out var edge))
                 {
-                    var clusterDeath = deaths.TryGetValue(edge.SourceCluster, out var d) ? d : 1.0;
-                    if (clusterDeath > 0)
-                    {
-                        // Equation (8): GLOSH(xp) = 1 - ε_max(xp) / ε_max(Ci)
-                    scores[i] = Math.Max(0, Math.Min(1.0, 1.0 - edge.Lambda / clusterDeath));
-                    }
+                    // Equation (8): GLOSH(xp) = 1 - ε_max(xp) / ε(xp) = 1 - λ(xp) / λ_max(Ci).
+                    // A point with λ = ∞ sits exactly on its cluster's densest spot (duplicate
+                    // points): score 0, the same convention as the hdbscan library.
+                    scores[i] = double.IsPositiveInfinity(edge.Lambda)
+                        ? 0.0
+                        : Math.Max(0, Math.Min(1.0, 1.0 - edge.Lambda / deaths[edge.SourceCluster]));
                 }
             }
 
@@ -647,6 +759,76 @@ namespace HdbScan.Net
         // data point (leaf). This convention matches scipy's linkage matrix format
         // and sklearn's condensed tree layout.
         // ================================================================================
+
+        /// <summary>
+        /// The pairwise distances between the n points, handed out one row at a time.
+        /// Core distances and the MST only ever need whole rows, so the distances can either
+        /// be stored (<see cref="DistanceMatrix"/>) or be computed at the moment a row is asked for.
+        /// </summary>
+        internal abstract class Distances(int count)
+        {
+            /// <summary>The number of points n.</summary>
+            public int Count { get; } = count;
+
+            /// <summary>
+            /// The distances from point <paramref name="i"/> to all n points.
+            /// </summary>
+            /// <param name="i">The point.</param>
+            /// <param name="buffer">Scratch space of length n that may be used to hold the result.</param>
+            /// <param name="skip">Entries j with skip[j] = true are not needed and may hold any value.</param>
+            /// <param name="parallelism">Number of threads that may be used to compute the row.</param>
+            public abstract ReadOnlySpan<double> Row(int i, double[] buffer, bool[]? skip = null, int parallelism = 1);
+        }
+
+        /// <summary>
+        /// All n×n distances stored as a flat array in row-major order.
+        /// </summary>
+        internal sealed class DistanceMatrix(double[] matrix, int n) : Distances(n)
+        {
+            public override ReadOnlySpan<double> Row(int i, double[] buffer, bool[]? skip = null, int parallelism = 1)
+            {
+                return matrix.AsSpan(i * Count, Count);
+            }
+        }
+
+        /// <summary>
+        /// Runs body(0) ... body(count - 1): in order when parallelism is 1, otherwise in
+        /// parallel on at most that many threads (-1 = no limit).
+        /// </summary>
+        internal static void For(int count, int parallelism, Action<int> body)
+        {
+            For<object?>(count, parallelism, () => null, (i, _) => body(i));
+        }
+
+        /// <summary>
+        /// The same, for a body that needs scratch space: <paramref name="newScratch"/> makes one
+        /// per thread, and it is passed to every body call on that thread.
+        /// </summary>
+        internal static void For<TScratch>(int count, int parallelism, Func<TScratch> newScratch, Action<int, TScratch> body)
+        {
+            if (parallelism == 1)
+            {
+                var scratch = newScratch();
+                for (var i = 0; i < count; i++)
+                {
+                    body(i, scratch);
+                }
+
+                return;
+            }
+
+            try
+            {
+                Parallel.For(0, count, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, newScratch,
+                    (i, _, scratch) => { body(i, scratch); return scratch; }, _ => { });
+            }
+            catch (AggregateException e)
+            {
+                // Parallel.For wraps exceptions; rethrow the original one (for example the
+                // ArgumentException for an invalid distance), as in the non-parallel case.
+                ExceptionDispatchInfo.Capture(e.InnerExceptions[0]).Throw();
+            }
+        }
 
         internal readonly struct MstEdge(int a, int b, double distance)
         {

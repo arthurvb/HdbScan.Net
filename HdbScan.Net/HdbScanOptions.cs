@@ -29,6 +29,8 @@ namespace HdbScan.Net
         private int? minSamples;
         private ClusterSelectionMethod clusterSelectionMethod;
         private bool allowSingleCluster;
+        private bool storeDistanceMatrix;
+        private int maxDegreeOfParallelism;
 
         /// <summary>
         /// Creates an instance of <see cref="HdbScanOptions"/> with default parameters.
@@ -39,6 +41,8 @@ namespace HdbScan.Net
             minSamples = null;
             clusterSelectionMethod = ClusterSelectionMethod.ExcessOfMass;
             allowSingleCluster = false;
+            storeDistanceMatrix = true;
+            maxDegreeOfParallelism = 1;
         }
 
         /// <summary>
@@ -61,7 +65,8 @@ namespace HdbScan.Net
 
         /// <summary>
         /// The number of samples in a neighborhood for a point to be considered a core point,
-        /// including the point itself. Must be at least 2.
+        /// including the point itself. Must be at least 1; with 1 every point is a core point
+        /// and the mutual reachability distance is the plain distance.
         /// If not set, defaults to <see cref="MinClusterSize"/>.
         /// </summary>
         /// <remarks>
@@ -75,9 +80,9 @@ namespace HdbScan.Net
 
             set
             {
-                if (value < 2)
+                if (value < 1)
                 {
-                    throw new ArgumentOutOfRangeException(nameof(value), "The minimum samples must be at least 2.");
+                    throw new ArgumentOutOfRangeException(nameof(value), "The minimum samples must be at least 1.");
                 }
 
                 minSamples = value;
@@ -100,6 +105,46 @@ namespace HdbScan.Net
         {
             get => allowSingleCluster;
             set => allowSingleCluster = value;
+        }
+
+        /// <summary>
+        /// Whether to compute every pairwise distance once and keep them all in memory.
+        /// This is the fastest way, but takes 8·n² bytes for n points (800 MB for 10,000 points,
+        /// 17 GB for 46,000). The default is true.
+        /// </summary>
+        /// <remarks>
+        /// If false, or if there are more than 46,340 points (the matrix then no longer fits in
+        /// one array), distances are computed at the moment they are needed and not kept.
+        /// Memory use is then proportional to n, the distance metric is called three times as
+        /// often, and the result is exactly the same.
+        /// </remarks>
+        public bool StoreDistanceMatrix
+        {
+            get => storeDistanceMatrix;
+            set => storeDistanceMatrix = value;
+        }
+
+        /// <summary>
+        /// The maximum number of threads that compute distances at the same time, or -1 for
+        /// no limit (all processors). The default is 1: no parallelism.
+        /// </summary>
+        /// <remarks>
+        /// With a value other than 1 the distance metric is called from several threads at
+        /// once, so it must be thread-safe. The result does not depend on this setting.
+        /// </remarks>
+        public int MaxDegreeOfParallelism
+        {
+            get => maxDegreeOfParallelism;
+
+            set
+            {
+                if (value < 1 && value != -1)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(value), "The maximum degree of parallelism must be at least 1, or -1 for no limit.");
+                }
+
+                maxDegreeOfParallelism = value;
+            }
         }
     }
 }

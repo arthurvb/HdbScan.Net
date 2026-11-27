@@ -57,8 +57,8 @@ namespace HdbScan.Net.Test
         private static HdbScanAlgorithm.SingleLinkageNode[] BuildDendrogram(double[][] pts, int k)
         {
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, pts.Length, k);
-            var mst = HdbScanAlgorithm.BuildMst(dm, pts.Length, core);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, pts.Length), k);
+            var mst = HdbScanAlgorithm.BuildMst(new HdbScanAlgorithm.DistanceMatrix(dm, pts.Length), core);
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             return HdbScanAlgorithm.BuildSingleLinkageTree(mst, pts.Length);
         }
@@ -144,7 +144,7 @@ namespace HdbScan.Net.Test
         {
             double[][] pts = { new[] { 0.0 }, new[] { 1.0 }, new[] { 3.0 }, new[] { 6.0 } };
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, 4, 3);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, 4), 3);
 
             Assert.That(core[0], Is.EqualTo(3.0).Within(1e-10), "P0: 3rd neighbor at distance 3");
             Assert.That(core[1], Is.EqualTo(2.0).Within(1e-10), "P1: 3rd neighbor at distance 2");
@@ -167,11 +167,11 @@ namespace HdbScan.Net.Test
         {
             double[][] pts = { new[] { 0.0 }, new[] { 1.0 }, new[] { 3.0 }, new[] { 6.0 } };
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, 4, 3);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, 4), 3);
 
-            Assert.That(HdbScanAlgorithm.MutualReachabilityDistance(dm, 4, core, 0, 1), Is.EqualTo(3.0).Within(1e-10), "core_a wins");
-            Assert.That(HdbScanAlgorithm.MutualReachabilityDistance(dm, 4, core, 1, 2), Is.EqualTo(3.0).Within(1e-10), "core_b wins");
-            Assert.That(HdbScanAlgorithm.MutualReachabilityDistance(dm, 4, core, 0, 3), Is.EqualTo(6.0).Within(1e-10), "d(a,b) wins");
+            Assert.That(HdbScanAlgorithm.MutualReachabilityDistance(core, 0, 1, dm[0 * 4 + 1]), Is.EqualTo(3.0).Within(1e-10), "core_a wins");
+            Assert.That(HdbScanAlgorithm.MutualReachabilityDistance(core, 1, 2, dm[1 * 4 + 2]), Is.EqualTo(3.0).Within(1e-10), "core_b wins");
+            Assert.That(HdbScanAlgorithm.MutualReachabilityDistance(core, 0, 3, dm[0 * 4 + 3]), Is.EqualTo(6.0).Within(1e-10), "d(a,b) wins");
         }
 
         /// <summary>
@@ -189,9 +189,9 @@ namespace HdbScan.Net.Test
         {
             double[][] pts = { new[] { 0.0 }, new[] { 1.0 }, new[] { 3.0 }, new[] { 6.0 } };
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, 4, 3);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, 4), 3);
 
-            var mst = HdbScanAlgorithm.BuildMst(dm, 4, core);
+            var mst = HdbScanAlgorithm.BuildMst(new HdbScanAlgorithm.DistanceMatrix(dm, 4), core);
             Assert.That(mst.Length, Is.EqualTo(3), "MST of 4 points has 3 edges");
 
             var totalWeight = mst.Sum(e => e.Distance);
@@ -223,8 +223,8 @@ namespace HdbScan.Net.Test
         {
             double[][] pts = { new[] { 0.0 }, new[] { 1.0 }, new[] { 3.0 }, new[] { 6.0 } };
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, 4, 3);
-            var mst = HdbScanAlgorithm.BuildMst(dm, 4, core);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, 4), 3);
+            var mst = HdbScanAlgorithm.BuildMst(new HdbScanAlgorithm.DistanceMatrix(dm, 4), core);
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             var slt = HdbScanAlgorithm.BuildSingleLinkageTree(mst, 4);
 
@@ -257,17 +257,16 @@ namespace HdbScan.Net.Test
         /// so no split produces two children >= 2. Only the root cluster exists.
         ///
         /// Points fall out at decreasing density (increasing distance):
-        ///   P3 at lambda=1/(5+eps)  -- most isolated, departs first
-        ///   P0, P1, P2 at lambda=1/(3+eps) -- denser region, depart later
+        ///   P3 at lambda=1/5  -- most isolated, departs first
+        ///   P0, P1, P2 at lambda=1/3 -- denser region, depart later
         /// </summary>
         [Test]
         public void CondenseTree_PointsFallOut()
         {
-            var eps = HdbScanAlgorithm.CondenseEpsilon;
             double[][] pts = { new[] { 0.0 }, new[] { 1.0 }, new[] { 3.0 }, new[] { 6.0 } };
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, 4, 3);
-            var mst = HdbScanAlgorithm.BuildMst(dm, 4, core);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, 4), 3);
+            var mst = HdbScanAlgorithm.BuildMst(new HdbScanAlgorithm.DistanceMatrix(dm, 4), core);
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             var slt = HdbScanAlgorithm.BuildSingleLinkageTree(mst, 4);
             var condensed = HdbScanAlgorithm.CondenseTree(slt, 2);
@@ -280,17 +279,17 @@ namespace HdbScan.Net.Test
             var pts4 = condensed.Where(e => e.Target < 4).ToList();
             Assert.That(pts4.Select(e => e.Target).OrderBy(x => x), Is.EqualTo(new[] { 0, 1, 2, 3 }));
 
-            // P3 falls out at lambda = 1/(5+eps) -- lowest density
+            // P3 falls out at lambda = 1/5 -- lowest density
             var p3 = pts4.First(e => e.Target == 3);
-            Assert.That(p3.Lambda, Is.EqualTo(1.0 / (5.0 + eps)).Within(1e-6),
-                "P3 (isolated) departs at lambda=1/(5+eps)");
+            Assert.That(p3.Lambda, Is.EqualTo(1.0 / 5.0).Within(1e-12),
+                "P3 (isolated) departs at lambda=1/5");
 
-            // P0, P1, P2 fall out at lambda = 1/(3+eps) -- higher density
-            var lam3 = 1.0 / (3.0 + eps);
+            // P0, P1, P2 fall out at lambda = 1/3 -- higher density
+            var lam3 = 1.0 / 3.0;
             foreach (var pt in new[] { 0, 1, 2 })
             {
                 var e = pts4.First(x => x.Target == pt);
-                Assert.That(e.Lambda, Is.EqualTo(lam3).Within(1e-6), $"P{pt} departs at lambda=1/(3+eps)");
+                Assert.That(e.Lambda, Is.EqualTo(lam3).Within(1e-12), $"P{pt} departs at lambda=1/3");
             }
         }
 
@@ -310,8 +309,8 @@ namespace HdbScan.Net.Test
         /// The inter-cluster MST edge connects P1=(1,0) to P3=(10,0) with d=9.
         /// Both core distances are smaller (intra-cluster), so the raw distance
         /// dominates: MRD(P1, P3) = max(core(P1), core(P3), 9) = 9.
-        /// Child clusters are born at lambda=1/(9+eps). Points within each cluster
-        /// fall out at lambda=1/(sqrt(2)+eps) (the intra-cluster MRD).
+        /// Child clusters are born at lambda=1/9. Points within each cluster
+        /// fall out at lambda=1/sqrt(2) (the intra-cluster MRD).
         /// </summary>
         [Test]
         public void CondenseTree_GenuineSplit()
@@ -322,8 +321,8 @@ namespace HdbScan.Net.Test
                 new[] { 10.0, 0.0 }, new[] { 11.0, 0.0 }, new[] { 10.0, 1.0 }
             };
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, 6, 3);
-            var mst = HdbScanAlgorithm.BuildMst(dm, 6, core);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, 6), 3);
+            var mst = HdbScanAlgorithm.BuildMst(new HdbScanAlgorithm.DistanceMatrix(dm, 6), core);
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             var slt = HdbScanAlgorithm.BuildSingleLinkageTree(mst, 6);
             var condensed = HdbScanAlgorithm.CondenseTree(slt, 3);
@@ -358,7 +357,7 @@ namespace HdbScan.Net.Test
         /// Using the 6-point two-cluster condensed tree from test 7.
         ///
         /// Stability S(C) = sum (lambda_point - lambda_birth) for each edge in C.
-        ///   Root:   birth=0,       3 points each side at lambda_split -> S approx 6/(9+eps) approx 0.67
+        ///   Root:   birth=0,       3 points each side at lambda_split -> S approx 6/9 approx 0.67
         ///   Child1: birth=lambda_split, 3 points at lambda_intra     -> S approx 3*(1/sqrt(2) - 1/9) approx 1.79
         ///   Child2: same by symmetry                                 -> S approx 1.79
         ///
@@ -373,16 +372,16 @@ namespace HdbScan.Net.Test
                 new[] { 10.0, 0.0 }, new[] { 11.0, 0.0 }, new[] { 10.0, 1.0 }
             };
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, 6, 3);
-            var mst = HdbScanAlgorithm.BuildMst(dm, 6, core);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, 6), 3);
+            var mst = HdbScanAlgorithm.BuildMst(new HdbScanAlgorithm.DistanceMatrix(dm, 6), core);
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             var slt = HdbScanAlgorithm.BuildSingleLinkageTree(mst, 6);
             var condensed = HdbScanAlgorithm.CondenseTree(slt, 3);
 
-            var (labels, _, count) = HdbScanAlgorithm.ExtractClusters(
+            var (labels, _, selection) = HdbScanAlgorithm.ExtractClusters(
                 condensed, 6, ClusterSelectionMethod.ExcessOfMass, false);
 
-            Assert.That(count, Is.EqualTo(2), "EOM selects 2 clusters");
+            Assert.That(selection.ClusterCount, Is.EqualTo(2), "EOM selects 2 clusters");
 
             // Cluster A: P0, P1, P2 share one label
             Assert.That(labels[0], Is.EqualTo(labels[1]));
@@ -412,17 +411,17 @@ namespace HdbScan.Net.Test
         ///
         /// Condensed tree (minClusterSize=3):
         ///   Root (7) splits into cluster A (8, size 4) and cluster B (9, size 3)
-        ///     at λ_birth = 1/(22+ε).
-        ///   Cluster A: P3 falls out at λ=1/(7+ε)   (straggler, low density)
-        ///              P0,P1,P2 fall out at λ=1/(2+ε) (core, high density)
-        ///   Cluster B: P4,P5,P6 all fall out at λ=1/(2+ε) (uniform density)
+        ///     at λ_birth = 1/22.
+        ///   Cluster A: P3 falls out at λ=1/7   (straggler, low density)
+        ///              P0,P1,P2 fall out at λ=1/2 (core, high density)
+        ///   Cluster B: P4,P5,P6 all fall out at λ=1/2 (uniform density)
         ///
         /// GLOSH: score(p) = 1 - λ_p / λ_max(cluster)
         ///
-        ///   λ_max(A) = 1/(2+ε)  (peak density from core points)
-        ///   λ_max(B) = 1/(2+ε)  (all points at same density)
+        ///   λ_max(A) = 1/2  (peak density from core points)
+        ///   λ_max(B) = 1/2  (all points at same density)
         ///
-        ///   P3: score = 1 - (1/(7+ε)) / (1/(2+ε)) = 1 - (2+ε)/(7+ε) = 5/(7+ε) ≈ 5/7
+        ///   P3: score = 1 - (1/7) / (1/2) = 1 - 2/7 = 5/7
         ///       Straggler departs far below peak density -> strong outlier signal.
         ///   P0,P1,P2: score = 1 - 1 = 0   (at peak density of cluster A)
         ///   P4,P5,P6: score = 1 - 1 = 0   (at peak density of cluster B)
@@ -441,8 +440,8 @@ namespace HdbScan.Net.Test
                 new[] { 30.0 }, new[] { 31.0 }, new[] { 32.0 }
             };
             var dm = ComputeDistMatrix(pts);
-            var core = HdbScanAlgorithm.ComputeCoreDistances(dm, 7, 3);
-            var mst = HdbScanAlgorithm.BuildMst(dm, 7, core);
+            var core = HdbScanAlgorithm.ComputeCoreDistances(new HdbScanAlgorithm.DistanceMatrix(dm, 7), 3);
+            var mst = HdbScanAlgorithm.BuildMst(new HdbScanAlgorithm.DistanceMatrix(dm, 7), core);
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             var slt = HdbScanAlgorithm.BuildSingleLinkageTree(mst, 7);
             var condensed = HdbScanAlgorithm.CondenseTree(slt, 3);
@@ -457,10 +456,9 @@ namespace HdbScan.Net.Test
                 Assert.That(s, Is.LessThanOrEqualTo(1.0));
             }
 
-            // P3 (straggler): score = 5/(7+ε) ≈ 5/7 ≈ 0.714
-            var eps = HdbScanAlgorithm.CondenseEpsilon;
-            Assert.That(scores[3], Is.EqualTo(5.0 / (7.0 + eps)).Within(1e-6),
-                "P3 (straggler) score = 1 - (2+ε)/(7+ε) = 5/(7+ε) ≈ 5/7");
+            // P3 (straggler): score = 1 - 2/7 = 5/7 ≈ 0.714
+            Assert.That(scores[3], Is.EqualTo(5.0 / 7.0).Within(1e-12),
+                "P3 (straggler) score = 1 - 2/7 = 5/7");
 
             // Core points of cluster A: at peak density -> score 0
             Assert.That(scores[0], Is.EqualTo(0.0).Within(1e-6), "P0 at peak density of cluster A");

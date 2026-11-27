@@ -38,6 +38,8 @@ namespace HdbScan.Net
         private readonly T[]? points;
         private readonly double[]? coreDistances;
         private readonly Func<T, T, double>? distanceMetric;
+        private readonly int minSamples;
+        private readonly HdbScanAlgorithm.ClusterSelection? selection;
 
         /// <summary>
         /// Applies the HDBSCAN algorithm to the given set of points.
@@ -47,6 +49,8 @@ namespace HdbScan.Net
         /// </param>
         /// <param name="distanceMetric">
         /// The distance metric to calculate the distance between points.
+        /// It must be symmetric and return finite, non-negative values. It is called once
+        /// per pair of distinct points; the distance from a point to itself is taken as 0.
         /// </param>
         /// <param name="options">
         /// Specifies options for HDBSCAN. If null, default options are used.
@@ -54,6 +58,10 @@ namespace HdbScan.Net
         /// <param name="predictionData">
         /// If true, stores data needed for predicting cluster membership of new points.
         /// </param>
+        /// <exception cref="ArgumentException">
+        /// <paramref name="points"/> is empty, or <paramref name="distanceMetric"/> returned a
+        /// NaN, infinite or negative distance.
+        /// </exception>
         public HdbScan(IReadOnlyList<T> points, Func<T, T, double> distanceMetric, HdbScanOptions? options = null, bool predictionData = false)
         {
             ArgumentNullException.ThrowIfNull(points);
@@ -66,7 +74,13 @@ namespace HdbScan.Net
 
             options ??= new HdbScanOptions();
             var minClusterSize = options.MinClusterSize;
-            var minSamples = options.MinSamples;
+            minSamples = options.MinSamples;
+
+            if (predictionData)
+            {
+                this.points = points.ToArray();
+                this.distanceMetric = distanceMetric;
+            }
 
             if (points.Count < minClusterSize)
             {
@@ -91,17 +105,24 @@ namespace HdbScan.Net
             //   6. Extract flat clustering           (Section 5.2, Algorithm 3)
             //   7. Compute outlier scores            (Section 6, Algorithm 4 — GLOSH)
 
-            var distMatrix = ComputeDistanceMatrix(points, distanceMetric);
-            var coreDistances = HdbScanAlgorithm.ComputeCoreDistances(distMatrix, n, minSamples);
+            // Steps 1-3 are the only ones that look at distances. Storing all n×n of them is
+            // fastest; when that is switched off, or n×n is more than one array can hold
+            // (n > 46,340), they are computed on demand instead. Both give the same result.
+            var parallelism = options.MaxDegreeOfParallelism;
+            HdbScanAlgorithm.Distances distances = options.StoreDistanceMatrix && (long)n * n <= Array.MaxLength
+                ? new HdbScanAlgorithm.DistanceMatrix(ComputeDistanceMatrix(points, distanceMetric, parallelism), n)
+                : new OnDemandDistances(points.ToArray(), distanceMetric);
 
-            var mst = HdbScanAlgorithm.BuildMst(distMatrix, n, coreDistances);
+            var coreDistances = HdbScanAlgorithm.ComputeCoreDistances(distances, minSamples, parallelism);
+
+            var mst = HdbScanAlgorithm.BuildMst(distances, coreDistances, parallelism);
 
             Array.Sort(mst, (a, b) => a.Distance.CompareTo(b.Distance));
             var singleLinkageTree = HdbScanAlgorithm.BuildSingleLinkageTree(mst, n);
 
             var condensedTree = HdbScanAlgorithm.CondenseTree(singleLinkageTree, minClusterSize);
 
-            var (clusterLabels, clusterProbs, numClusters) = HdbScanAlgorithm.ExtractClusters(
+            var (clusterLabels, clusterProbs, clusterSelection) = HdbScanAlgorithm.ExtractClusters(
                 condensedTree, n, options.ClusterSelectionMethod, options.AllowSingleCluster);
 
             var scores = HdbScanAlgorithm.ComputeOutlierScores(condensedTree, n);
@@ -109,13 +130,12 @@ namespace HdbScan.Net
             labels = clusterLabels;
             probabilities = clusterProbs;
             outlierScores = scores;
-            clusterCount = numClusters;
+            clusterCount = clusterSelection.ClusterCount;
 
             if (predictionData)
             {
-                this.points = points.ToArray();
                 this.coreDistances = coreDistances;
-                this.distanceMetric = distanceMetric;
+                selection = clusterSelection;
             }
         }
 
@@ -131,6 +151,12 @@ namespace HdbScan.Net
         /// <exception cref="InvalidOperationException">
         /// Prediction data was not stored during fitting.
         /// </exception>
+        /// <exception cref="ArgumentException">
+        /// The distance metric returned a NaN, infinite or negative distance.
+        /// </exception>
+        /// <remarks>
+        /// See <see cref="PredictWithProbability"/> for how the prediction is made.
+        /// </remarks>
         public int Predict(T x)
         {
             return PredictWithProbability(x).Label;
@@ -143,84 +169,47 @@ namespace HdbScan.Net
         /// The point to classify.
         /// </param>
         /// <returns>
-        /// The predicted cluster label and membership probability.
+        /// The predicted cluster label (-1 for noise) and membership probability (0 for noise).
         /// </returns>
         /// <exception cref="InvalidOperationException">
         /// Prediction data was not stored during fitting.
         /// </exception>
+        /// <exception cref="ArgumentException">
+        /// The distance metric returned a NaN, infinite or negative distance.
+        /// </exception>
         /// <remarks>
-        /// Prediction uses approximate soft clustering based on mutual reachability distance
-        /// to the nearest point in each cluster.
+        /// <para>
+        /// The clustering itself is not changed. The new point is attached to the cluster
+        /// hierarchy through its nearest training point in mutual reachability distance, and
+        /// then labelled like a training point in that position: it gets a cluster if it is
+        /// dense enough to be a member, and is noise otherwise. The probability is on the same
+        /// scale as <see cref="Probabilities"/>.
+        /// </para>
+        /// <para>
+        /// This is the approximate_predict method of the scikit-learn-contrib/hdbscan library.
+        /// The result can differ from re-clustering with the new point included.
+        /// </para>
         /// </remarks>
         public (int Label, double Probability) PredictWithProbability(T x)
         {
-            if (points == null || coreDistances == null || distanceMetric == null)
+            if (points == null || distanceMetric == null)
             {
                 throw new InvalidOperationException("Prediction data was not stored. Set predictionData=true when fitting.");
             }
 
-            if (clusterCount == 0)
+            // No clusters (or too few points to cluster at all): every new point is noise.
+            if (selection == null || coreDistances == null || clusterCount == 0)
             {
                 return (-1, 0);
             }
 
-            // For each cluster, find the minimum mutual reachability distance from x
-            // to any core point in that cluster. The new point's core distance is unknown,
-            // so we use a one-sided MRD: max(core(training_point), d(x, training_point)).
-            // This matches sklearn's approximate_predict approach.
-            var clusterDistances = new double[clusterCount];
-            for (var i = 0; i < clusterCount; i++)
-            {
-                clusterDistances[i] = double.MaxValue;
-            }
-
+            var distances = new double[points.Length];
             for (var i = 0; i < points.Length; i++)
             {
-                if (labels[i] >= 0)
-                {
-                    var dist = distanceMetric(x, points[i]);
-                    var mrd = Math.Max(coreDistances[i], dist);
-
-                    if (mrd < clusterDistances[labels[i]])
-                    {
-                        clusterDistances[labels[i]] = mrd;
-                    }
-                }
+                distances[i] = CheckDistance(distanceMetric(x, points[i]));
             }
 
-            var bestCluster = -1;
-            var bestDist = double.MaxValue;
-            for (var i = 0; i < clusterCount; i++)
-            {
-                if (clusterDistances[i] < bestDist)
-                {
-                    bestDist = clusterDistances[i];
-                    bestCluster = i;
-                }
-            }
-
-            if (bestCluster == -1)
-            {
-                return (-1, 0);
-            }
-
-            // Soft assignment: probability proportional to inverse distance.
-            const double epsilon = 1e-10;
-            var prob = 1.0;
-            if (clusterCount > 1)
-            {
-                var sumInv = 0.0;
-                for (var i = 0; i < clusterCount; i++)
-                {
-                    if (clusterDistances[i] < double.MaxValue)
-                    {
-                        sumInv += 1.0 / (clusterDistances[i] + epsilon);
-                    }
-                }
-                prob = (1.0 / (bestDist + epsilon)) / sumInv;
-            }
-
-            return (bestCluster, prob);
+            return selection.Predict(distances, coreDistances, minSamples);
         }
 
         /// <summary>
@@ -255,22 +244,62 @@ namespace HdbScan.Net
         /// dm(i,j) for i &lt; j, then mirrors). Stored as a flat double[] in row-major order
         /// for cache-friendly access. Diagonal entries are 0.
         /// </summary>
-        private static double[] ComputeDistanceMatrix(IReadOnlyList<T> points, Func<T, T, double> dm)
+        private static double[] ComputeDistanceMatrix(IReadOnlyList<T> points, Func<T, T, double> dm, int parallelism)
         {
             var n = points.Count;
             var matrix = new double[n * n];
 
-            for (var i = 0; i < n; i++)
+            // Every (i, j) pair is written by the iteration of its smaller index only,
+            // so the iterations can run in parallel.
+            HdbScanAlgorithm.For(n, parallelism, i =>
             {
                 for (var j = i + 1; j < n; j++)
                 {
-                    var d = dm(points[i], points[j]);
+                    var d = CheckDistance(dm(points[i], points[j]));
                     matrix[i * n + j] = d;
                     matrix[j * n + i] = d;
                 }
-            }
+            });
 
             return matrix;
+        }
+
+        /// <summary>
+        /// Distances that are not stored but computed each time a row is asked for, so no
+        /// memory of size n² is needed. Calls dm(i, j) with i &lt; j, exactly like
+        /// <see cref="ComputeDistanceMatrix"/>, so both give the same values.
+        /// </summary>
+        private sealed class OnDemandDistances(T[] points, Func<T, T, double> dm)
+            : HdbScanAlgorithm.Distances(points.Length)
+        {
+            public override ReadOnlySpan<double> Row(int i, double[] buffer, bool[]? skip = null, int parallelism = 1)
+            {
+                HdbScanAlgorithm.For(points.Length, parallelism, j =>
+                {
+                    if (skip == null || !skip[j])
+                    {
+                        buffer[j] = i == j ? 0.0 : CheckDistance(i < j ? dm(points[i], points[j]) : dm(points[j], points[i]));
+                    }
+                });
+
+                return buffer;
+            }
+        }
+
+        /// <summary>
+        /// The algorithm is only defined for real distances. A NaN, infinite or negative value
+        /// would not fail by itself but silently produce a meaningless clustering, so reject it.
+        /// </summary>
+        private static double CheckDistance(double d)
+        {
+            if (!double.IsFinite(d) || d < 0)
+            {
+                throw new ArgumentException(
+                    $"The distance metric returned {d}. Distances must be finite and non-negative.",
+                    nameof(distanceMetric));
+            }
+
+            return d;
         }
     }
 }

@@ -51,10 +51,11 @@ jobs:
       - name: Pack
         run: dotnet pack HdbScan.Net/HdbScan.Net.csproj --no-build --configuration Release /p:Version=${{ steps.version.outputs.VERSION }} --output ./nupkg
 
+      # NuGet first: if the push fails, no GitHub release is left behind without a package.
+      - name: Push to NuGet
+        run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" ./nupkg/*.nupkg --generate-notes
-
-      - name: Push to NuGet
-        run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
