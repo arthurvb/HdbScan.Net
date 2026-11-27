@@ -12,6 +12,8 @@ HDBSCAN extends DBSCAN by building a hierarchy of clusterings at all density lev
 dotnet add package HdbScan.Net
 ```
 
+Requires .NET 10 or later.
+
 ## Usage
 
 ```csharp
@@ -41,6 +43,8 @@ for (var i = 0; i < model.Labels.Count; i++)
 }
 ```
 
+Clusters are numbered 0, 1, 2, ... A label of `-1` means noise: the point belongs to no cluster, and its probability is 0. For clustered points the probability says how strongly the point belongs to its cluster, from just above 0 (on the edge) to 1 (in the densest part).
+
 ### Custom types
 
 HDBSCAN works with any type as long as you provide a distance function:
@@ -66,7 +70,10 @@ Store prediction data to classify new points after fitting:
 var model = new HdbScan<double[]>(points, euclidean, options, predictionData: true);
 
 var (label, probability) = model.PredictWithProbability(newPoint);
+var labelOnly = model.Predict(newPoint);
 ```
+
+With `predictionData: true` the model keeps the points and the distance function (`model.HasPredictionData` is then true); without it, predicting throws an `InvalidOperationException`. Each prediction computes the distance from the new point to every training point.
 
 The clustering itself does not change. The new point is attached to the cluster hierarchy through its nearest training point (in mutual reachability distance) and labelled like a training point in that position, so a point that is not dense enough to belong to any cluster gets label `-1` (noise) and probability 0. Predicting a training point returns its fitted label and probability. This is the `approximate_predict` method of the scikit-learn-contrib/hdbscan library.
 
@@ -95,7 +102,9 @@ for (var i = 0; i < model.OutlierScores.Count; i++)
 
 ### Distance function
 
-The distance function must be symmetric and return finite, non-negative values; anything else throws an `ArgumentException`.
+The distance function must be symmetric and return finite, non-negative values; a NaN, infinite or negative distance throws an `ArgumentException`.
+
+Duplicate points (distance 0) are allowed. A group of duplicates that is large enough to be a cluster is the densest region there can be: those points get probability 1 and outlier score 0.
 
 ### Large data sets
 
@@ -114,7 +123,7 @@ var options = new HdbScanOptions
 };
 ```
 
-As an indication: 200,000 three-dimensional points with Euclidean distance take a little over two minutes on a 12-core laptop with `MaxDegreeOfParallelism = -1`.
+As an indication: 200,000 three-dimensional points with Euclidean distance take about 6.5 minutes on one thread (the default) and a little over two minutes with `MaxDegreeOfParallelism = -1` on a 12-core laptop. A more expensive distance function takes proportionally longer.
 
 ## sklearn compatibility
 
@@ -132,6 +141,17 @@ If you are migrating from the **scikit-learn-contrib/hdbscan** library (which ex
 // sklearn.cluster.HDBSCAN / HdbScan.Net: MinSamples = 5
 var options = new HdbScanOptions { MinSamples = 5 };
 ```
+
+## Upgrading from 1.0.x
+
+Version 1.1.0 fixes several bugs, and some results change because of that:
+
+- **Prediction** can now return noise (`-1`) for points that are too far from every cluster; before, every point was assigned to the nearest cluster. The returned probability is now a membership probability on the same scale as `Probabilities`.
+- **`AllowSingleCluster`**: when all data forms one cluster, points in its sparse outskirts are now noise, as in scikit-learn; before, every point was labelled.
+- **Cluster numbers** now follow scikit-learn's numbering. The clusters themselves are the same, but a cluster can have a different number than in 1.0.x.
+- **Probabilities and outlier scores** no longer depend on the scale of the data. They change noticeably only for data with very small distances (around 1e-9 and below) or with duplicate points.
+- **Invalid distances** (NaN, infinite, negative) throw an `ArgumentException`; before, they gave a crash or a meaningless result.
+- **More than 46,340 points** are now supported, see [large data sets](#large-data-sets).
 
 ## A note on AI assistance
 
